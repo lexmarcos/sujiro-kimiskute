@@ -1,181 +1,121 @@
 # Sujiro Kimiskute
 
-Bot de música minimalista para Discord, escrito em Rust e controlado somente por slash commands. Esta versão reproduz buscas, vídeos e playlists do YouTube com `yt-dlp`, mantém uma fila independente por servidor e guarda todo o estado apenas em memória.
+<img src="https://i.imgur.com/2xA2jME.png" alt="Sujiro Kimiskute" />
 
-## Requisitos
+A fast, clean, and lightweight Discord music bot written in Rust. Plays YouTube audio via slash commands. No bloat, no dashboards, no databases — just music.
 
-- Rust 1.88 ou mais recente;
-- `yt-dlp` disponível no `PATH` ou indicado por `YT_DLP_PATH`;
-- `pkg-config` e a biblioteca de desenvolvimento do Opus;
-- FFmpeg;
-- uma aplicação Discord com um bot configurado.
+Runs comfortably on a Raspberry Pi, a cheap VPS, or even an Android phone with [UserLAnd](https://userland.tech/) or [Termux](https://termux.dev/).
 
-### Instalação no Ubuntu
+## Why Sujiro?
 
-Instale as dependências nativas e o `pipx`:
+Most people want a Discord bot that plays music. That's it. No web panels, no lyrics, no voting systems — just drop in a link and listen. Sujiro does exactly that and stays out of your way.
+
+## About the name
+
+**Sujiro Kimiskute** is a Japanese-sounding phonetic pun on the Portuguese phrase *"Sugiro que me escute"* — "I suggest you listen to me." A fitting name for a music bot.
+
+## Quick start
+
+### Dependencies
 
 ```bash
-sudo apt update
+# Ubuntu / Debian
 sudo apt install -y build-essential pkg-config libopus-dev ffmpeg pipx
-pipx ensurepath
-```
+pipx ensurepath && pipx install yt-dlp
 
-Abra um novo shell após `pipx ensurepath` e instale o `yt-dlp`:
-
-```bash
-pipx install yt-dlp
-yt-dlp --version
-```
-
-Instale o Rust pelo `rustup`, caso ainda não esteja disponível:
-
-```bash
+# Rust (1.88+)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustup default stable
-rustc --version
 ```
 
-Confirme que a versão exibida é 1.88 ou superior.
+### Discord setup
 
-## Configuração do Discord
+1. Create an app at [Discord Developer Portal](https://discord.com/developers/applications).
+2. Add a bot, copy the token and Application ID.
+3. In OAuth2 > URL Generator, pick `bot` + `applications.commands` scopes.
+4. Grant: View Channel, Send Messages, Connect, Speak.
+5. Invite the bot with the generated URL.
 
-1. Acesse o [Discord Developer Portal](https://discord.com/developers/applications) e crie uma aplicação.
-2. Na seção **Bot**, adicione um bot e copie o token. Nunca publique ou faça commit desse valor.
-3. Copie o **Application ID** na página **General Information**.
-4. Em **OAuth2 > URL Generator**, selecione os scopes `bot` e `applications.commands`.
-5. Conceda ao bot somente estas permissões:
-   - View Channel;
-   - Send Messages;
-   - Connect;
-   - Speak.
-6. Abra a URL gerada e adicione o bot ao servidor desejado.
-
-O cliente solicita somente os gateway intents `GUILDS` e `GUILD_VOICE_STATES`. Ele não usa Message Content. O estado de voz não possui um toggle privilegiado separado no Developer Portal.
-
-Os comandos são registrados globalmente quando o bot fica pronto. Alterações em comandos globais podem levar algum tempo para aparecer em todos os servidores.
-
-## Variáveis de ambiente
-
-Crie o arquivo local de configuração:
+### Configure
 
 ```bash
 cp .env.example .env
+# Fill in DISCORD_TOKEN and DISCORD_APPLICATION_ID
 ```
 
-Preencha pelo menos as duas variáveis obrigatórias:
+See `.env.example` for optional settings (timeouts, queue size, auto-leave, etc.).
 
-```dotenv
-DISCORD_TOKEN=cole_o_token_do_bot_aqui
-DISCORD_APPLICATION_ID=cole_o_application_id_aqui
-
-YT_DLP_PATH=yt-dlp
-YT_DLP_EXTRA_ARGS=
-YT_DLP_TIMEOUT_SECONDS=20
-AUTO_LEAVE_SECONDS=120
-MAX_QUEUE_SIZE=50
-MAX_CONCURRENT_RESOLUTIONS=4
-RUST_LOG=info
-```
-
-| Variável | Obrigatória | Default | Finalidade |
-| --- | --- | --- | --- |
-| `DISCORD_TOKEN` | Sim | — | Token secreto do bot. |
-| `DISCORD_APPLICATION_ID` | Sim | — | ID numérico da aplicação Discord. |
-| `YT_DLP_PATH` | Não | `yt-dlp` | Caminho ou nome do executável. |
-| `YT_DLP_EXTRA_ARGS` | Não | vazio | Argumentos adicionais separados com sintaxe compatível com `shlex`; cada argumento é enviado diretamente ao processo, sem shell. |
-| `YT_DLP_TIMEOUT_SECONDS` | Não | `20` | Timeout de cada execução do `yt-dlp`. |
-| `AUTO_LEAVE_SECONDS` | Não | `120` | Tempo sozinho no canal antes da desconexão automática. |
-| `MAX_QUEUE_SIZE` | Não | `50` | Quantidade máxima de faixas aguardando por servidor e limite de resolução de playlist. |
-| `MAX_CONCURRENT_RESOLUTIONS` | Não | `4` | Limite global de processos de resolução simultâneos. |
-| `RUST_LOG` | Não | `info` | Filtro do `tracing`, por exemplo `info` ou `sujiro_kimiskute=debug`. |
-
-Todos os valores numéricos configuráveis devem ser positivos. Variáveis de ambiente do processo têm precedência sobre o arquivo `.env`.
-
-## Execução
-
-Em desenvolvimento:
-
-```bash
-cargo run
-```
-
-Para gerar e executar o binário otimizado:
+### Run
 
 ```bash
 cargo build --release
 ./target/release/sujiro-kimiskute
 ```
 
-Use `Ctrl+C` para encerrar o cliente Discord de forma controlada.
+Or with Docker:
 
-## Comandos
+```bash
+docker build -t sujiro-kimiskute:local .
+docker run --rm --env-file .env sujiro-kimiskute:local
+```
 
-- `/play <query>` — aceita texto de busca, URL de vídeo ou URL de playlist do YouTube; conecta ao canal do usuário e adiciona o resultado à fila.
-- `/pause` — pausa a faixa atual.
-- `/resume` — retoma a faixa pausada.
-- `/skip` — encerra a faixa atual e avança uma vez.
-- `/stop` — interrompe a reprodução e limpa a fila, mantendo o bot conectado.
-- `/queue` — mostra a faixa atual e até dez próximas; pode ser usado por qualquer membro do servidor, mesmo fora do canal de voz.
-- `/leave` — interrompe a sessão, limpa a fila, desconecta o bot e remove o estado temporário do servidor.
+## Commands
 
-`/play` exige que o usuário esteja em um canal de voz. Os comandos de controle exigem que o usuário esteja no mesmo canal do bot. Há somente uma sessão de reprodução por servidor.
+| Command    | Description                                          |
+| ---------- | ---------------------------------------------------- |
+| `/play`    | Search, video URL, or playlist URL from YouTube      |
+| `/pause`   | Pause the current track                              |
+| `/resume`  | Resume playback                                     |
+| `/skip`    | Skip to the next track                               |
+| `/stop`    | Stop playback and clear the queue                    |
+| `/queue`   | Show current track and next up to 10                 |
+| `/leave`   | Clear queue, disconnect, and remove guild state       |
 
-Quando o bot fica sem usuários humanos no canal, inicia o timeout de auto-leave. A contagem é cancelada se alguém retornar ou iniciar uma nova atividade válida antes do prazo.
+`/play` requires you to be in a voice channel. Control commands (`/pause`, `/resume`, `/skip`, `/stop`) require you to be in the same channel as the bot. One session per server.
 
-Buscas retornam inicialmente um resultado. URLs de vídeo resolvem uma faixa. Playlists são limitadas por `MAX_QUEUE_SIZE`; se houver menos espaço livre na fila, somente o prefixo que couber é adicionado, preservando a ordem, e o bot informa quantas faixas foram omitidas.
+The bot auto-disconnects after `AUTO_LEAVE_SECONDS` alone in the channel.
 
-## Logs
+## Architecture
 
-Os logs usam `tracing` e incluem contexto operacional como servidor, usuário, canal, faixa, duração de resolução e mudanças de reprodução. Ajuste o nível com `RUST_LOG`.
+```
+discord/   — Serenity handlers, slash commands, UI embeds
+player/    — Queue, playback state, guild lifecycle, auto-leave
+sources/   — Source resolution (currently YouTube via yt-dlp)
+voice/     — Songbird voice connection and event handling
+config/    — Environment-based configuration
+state/     — Shared application state
+```
 
-Tokens do Discord, cookies, PO Tokens, argumentos extras completos e URLs sensíveis não devem ser colocados em logs. Não inclua segredos no repositório; o arquivo `.env` já é ignorado pelo Git.
+YouTube-specific logic stays in `sources/youtube/`. The resolver trait is designed so Spotify or other sources can be added later without touching command handlers.
 
-## PO Token e opções avançadas do yt-dlp
+## YouTube PO Tokens
 
-O núcleo do bot não gera PO Tokens. Um PO Token provider ou plugin compatível deve ser instalado e mantido no mesmo ambiente do `yt-dlp`; isso é uma dependência de infraestrutura.
+A Proof of Origin (PO) Token lets YouTube verify that a request came from a genuine client. YouTube is gradually enforcing these tokens; without one, yt-dlp may expose fewer formats, receive HTTP 403 responses, or have the account/IP temporarily blocked.
 
-Argumentos adicionais podem ser fornecidos sem alterar o código. Por exemplo:
+Sujiro only invokes yt-dlp: it does not generate or store PO Tokens. The recommended setup is a [PO Token Provider plugin](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), installed on the same host as yt-dlp (or inside the same container). Once the provider and its dependencies are configured, select the currently recommended `mweb` client in `.env`:
 
 ```dotenv
 YT_DLP_EXTRA_ARGS=--extractor-args youtube:player_client=mweb
 ```
 
-O bot passa esses argumentos diretamente ao `yt-dlp`. Não grave PO Tokens, cookies ou outros segredos no código, no README ou na imagem de produção.
+Manual setup (**advanced, not recommended**) uses the current extractor argument format:
 
-## Docker
-
-Construa a imagem multi-stage:
-
-```bash
-docker build -t sujiro-kimiskute:local .
+```dotenv
+YT_DLP_EXTRA_ARGS=--extractor-args youtube:player_client=mweb;po_token=mweb.gvs+TOKEN
 ```
 
-Inicie o bot fornecendo as variáveis externamente:
+Do not commit or log PO Tokens or YouTube cookies. Keep them in `.env` and rotate them immediately if exposed. Manual tokens may be bound to a session or video and have a limited lifetime, which is why a provider is preferred. Docker users must build a custom image containing the provider plugin and all of its runtime dependencies; configuring the host alone is not enough.
 
-```bash
-docker run --rm \
-  --name sujiro-kimiskute \
-  --env-file .env \
-  sujiro-kimiskute:local
-```
+See the official yt-dlp [PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) and [YouTube extractor notes](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#youtube) for current requirements.
 
-A imagem executa como usuário não root e já contém `yt-dlp`, FFmpeg, certificados TLS e a biblioteca Opus. O caminho padrão do executável dentro do container é `/usr/local/bin/yt-dlp`; não inclua tokens, cookies ou outros segredos no build ou na imagem. Providers externos de PO Token não são incluídos e exigem uma imagem derivada ou outro mecanismo de infraestrutura.
+## Limitations (by design)
 
-Não há `HEALTHCHECK`: o bot não expõe endpoint HTTP ou outro indicador local que represente de forma confiável sua conexão com Discord e voz.
+- YouTube only (Spotify planned)
+- Slash commands only
+- In-memory state — lost on restart
+- No database, web dashboard, autoplay, filters, or lyrics
+- Playlist length capped by `MAX_QUEUE_SIZE`
 
-## Limitações atuais
-
-- somente YouTube; Spotify poderá ser adicionado futuramente;
-- somente slash commands;
-- estado e filas apenas em memória, perdidos ao reiniciar;
-- sem banco de dados, dashboard ou cache persistente;
-- sem autoplay, filtros, equalizador, normalização, letras ou download completo de áudio;
-- playlists limitadas pelo tamanho configurado da fila;
-- funcionamento sujeito à disponibilidade do YouTube, do `yt-dlp` e de eventuais providers externos;
-- esta etapa não inclui testes unitários, de integração, snapshots ou mocks.
-
-Para validar o código sem testes:
+## Validate
 
 ```bash
 cargo fmt --check

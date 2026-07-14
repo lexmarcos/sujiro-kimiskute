@@ -6,9 +6,11 @@ use serenity::{
 };
 use tracing::info;
 
-use crate::state::AppState;
+use crate::{player::playback::PlaybackSkipResult, state::AppState};
 
-use super::{respond, respond_app_error};
+use super::{respond, respond_app_error, truncate_text};
+
+const MAX_TITLE_CHARS: usize = 160;
 
 pub fn definition() -> CreateCommand {
     CreateCommand::new("skip").description("Pula a música atual")
@@ -23,7 +25,7 @@ pub async fn run(
         return respond(
             context,
             command,
-            "Este comando só pode ser usado em um servidor.",
+            "🏠 Use este comando dentro de um servidor.",
             true,
         )
         .await;
@@ -36,12 +38,24 @@ pub async fn run(
         Ok(player) => player,
         Err(source) => return respond_app_error(context, command, source).await,
     };
-    let skipped = match state.playback.skip(player).await {
-        Ok(skipped) => skipped,
+    let result = match state.playback.skip(player).await {
+        Ok(result) => result,
         Err(source) => return respond_app_error(context, command, source).await,
     };
-    let Some(track) = skipped else {
-        return respond(context, command, "Nenhuma música está tocando.", false).await;
+    let track = match result {
+        PlaybackSkipResult::NoTrack => {
+            return respond(
+                context,
+                command,
+                "🎵 Nenhuma música está tocando para pular.",
+                false,
+            )
+            .await;
+        }
+        PlaybackSkipResult::NoNext => {
+            return respond(context, command, "⏭️ Não há próxima música na fila.", false).await;
+        }
+        PlaybackSkipResult::Skipped { track } => track,
     };
 
     info!(
@@ -53,7 +67,10 @@ pub async fn run(
     respond(
         context,
         command,
-        &format!("Pulando: {}", track.track.title),
+        &format!(
+            "⏭️ **{}** foi pulada.",
+            truncate_text(&track.track.title, MAX_TITLE_CHARS)
+        ),
         false,
     )
     .await

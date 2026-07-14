@@ -6,6 +6,7 @@ use serenity::{
 };
 use tracing::info;
 
+use crate::discord::player_panel::stopped_message;
 use crate::state::AppState;
 
 use super::{respond, respond_app_error};
@@ -23,7 +24,7 @@ pub async fn run(
         return respond(
             context,
             command,
-            "Este comando só pode ser usado em um servidor.",
+            "🏠 Use este comando dentro de um servidor.",
             true,
         )
         .await;
@@ -54,7 +55,7 @@ pub async fn run(
     respond(
         context,
         command,
-        "Reprodução interrompida e fila limpa.",
+        &stopped_message(stopped.removed_tracks),
         false,
     )
     .await

@@ -1,46 +1,71 @@
 use std::sync::Arc;
 
 use serenity::{
-    all::{Context, EventHandler, Interaction, Ready, VoiceState},
+    all::{Context, EventHandler, GuildId, Interaction, Ready, VoiceState},
     async_trait,
 };
+use tokio::sync::OnceCell;
 use tracing::{error, info};
 
 use crate::state::AppState;
 
-use super::commands;
+use super::{commands, player_controls};
 
 pub struct DiscordEventHandler {
     state: Arc<AppState>,
+    commands_registered: OnceCell<()>,
 }
 
 impl DiscordEventHandler {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            commands_registered: OnceCell::new(),
+        }
+    }
+
+    async fn synchronize_commands(&self, context: &Context, guild_ids: &[GuildId]) {
+        let result = self
+            .commands_registered
+            .get_or_try_init(|| async move {
+                commands::register::reset_and_register(&context.http, guild_ids).await
+            })
+            .await;
+
+        if let Err(source) = result {
+            error!(
+                guild_id = ?source.guild_id(),
+                error = %source,
+                "failed to reset application commands"
+            );
+        }
     }
 }
 
 #[async_trait]
 impl EventHandler for DiscordEventHandler {
     async fn ready(&self, context: Context, ready: Ready) {
+        let guild_ids: Vec<GuildId> = ready.guilds.iter().map(|guild| guild.id).collect();
         info!(
             user_id = %ready.user.id,
             username = %ready.user.name,
-            guild_count = ready.guilds.len(),
+            guild_count = guild_ids.len(),
             "Discord bot ready"
         );
 
-        if let Err(source) = commands::register::register_global(&context.http).await {
-            error!(error = %source, "failed to register global commands");
-        }
+        self.synchronize_commands(&context, &guild_ids).await;
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
-        let Interaction::Command(command) = interaction else {
-            return;
-        };
-
-        commands::dispatch(&context, &command, &self.state).await;
+        match interaction {
+            Interaction::Command(command) => {
+                commands::dispatch(&context, &command, &self.state).await;
+            }
+            Interaction::Component(component) => {
+                player_controls::dispatch(&context, &component, &self.state).await;
+            }
+            _ => {}
+        }
     }
 
     async fn voice_state_update(&self, context: Context, old: Option<VoiceState>, new: VoiceState) {

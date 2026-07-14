@@ -12,7 +12,7 @@ use tracing::error;
 use crate::{
     error::{AppError, VoiceChannelIssue},
     player::{
-        guild_player::GuildPlayer,
+        guild_player::{GuildPlayer, GuildPlayerSnapshot},
         play_requests::{PlayCommitReceipt, PlayRequestReservation, PlayRequestTicket},
         track::{QueuedTrack, ResolvedTrack},
     },
@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::{MAX_RESPONSE_CHARS, respond, respond_app_error, truncate_text};
+use crate::discord::player_panel::{control_row, format_duration, now_playing_embed};
 
 const MAX_TITLE_CHARS: usize = 160;
 
@@ -48,7 +49,7 @@ pub async fn run(
         return respond(
             context,
             command,
-            "Este comando só pode ser usado em um servidor.",
+            "🏠 Use este comando dentro de um servidor.",
             true,
         )
         .await;
@@ -84,7 +85,10 @@ pub async fn run(
     let commit = wait_for_commit(ticket).await;
 
     match commit {
-        Ok(receipt) => edit_success(context, command, receipt).await,
+        Ok(receipt) => {
+            let snapshot = player.snapshot().await;
+            edit_success(context, command, receipt, &snapshot).await
+        }
         Err(error) => {
             error!(
                 guild_id = %guild_id,
@@ -285,13 +289,16 @@ async fn edit_success(
     context: &Context,
     command: &CommandInteraction,
     receipt: PlayCommitReceipt,
+    snapshot: &GuildPlayerSnapshot,
 ) -> Result<(), serenity::Error> {
-    command
-        .edit_response(
-            &context.http,
-            EditInteractionResponse::new().content(success_message(&receipt)),
-        )
-        .await?;
+    let response = match now_playing_embed(snapshot) {
+        Some(embed) => EditInteractionResponse::new()
+            .content(success_message(&receipt))
+            .embed(embed)
+            .components(vec![control_row(snapshot)]),
+        None => EditInteractionResponse::new().content(success_message(&receipt)),
+    };
+    command.edit_response(&context.http, response).await?;
     Ok(())
 }
 
@@ -313,36 +320,32 @@ fn success_message(receipt: &PlayCommitReceipt) -> String {
     let duration = receipt
         .first_track
         .duration_seconds
-        .map(|seconds| format!("\nDuração: {}", format_duration(seconds)))
+        .map(|seconds| format!(" · ⏱️ `{}`", format_duration(seconds)))
         .unwrap_or_default();
     let requester = format!("<@{}>", receipt.requested_by);
     let title = truncate_text(&receipt.first_track.title, MAX_TITLE_CHARS);
 
-    let message = if receipt.added == 1 && receipt.omitted == 0 {
+    let message = if receipt.added == 1 {
         format!(
-            "Adicionado à fila: {}{duration}\nSolicitado por: {requester}\nPosição: {}",
-            title, receipt.first_position
+            "✅ **{title}** adicionada à fila{duration}.\n📍 Posição: **{}** · Solicitada por {requester}{}",
+            receipt.first_position,
+            omitted_message(receipt.omitted)
         )
     } else {
-        let omitted = if receipt.omitted > 0 {
-            format!("\nOmitidas por limite: {}", receipt.omitted)
-        } else {
-            String::new()
-        };
         format!(
-            "Adicionadas à fila: {} músicas\nPrimeira: {}{duration}\nSolicitado por: {requester}\nPrimeira posição: {}{omitted}",
-            receipt.added, title, receipt.first_position
+            "✅ **{} músicas** adicionadas à fila.\n🎵 Primeira: **{title}**{duration}\n📍 Começa na posição **{}** · Solicitada por {requester}{omitted}",
+            receipt.added,
+            receipt.first_position,
+            omitted = omitted_message(receipt.omitted)
         )
     };
     truncate_text(&message, MAX_RESPONSE_CHARS)
 }
 
-fn format_duration(total_seconds: u64) -> String {
-    let hours = total_seconds / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-    if hours > 0 {
-        return format!("{hours}:{minutes:02}:{seconds:02}");
+fn omitted_message(omitted: usize) -> String {
+    match omitted {
+        0 => String::new(),
+        1 => "\n⚠️ 1 música não coube no limite da fila.".to_owned(),
+        count => format!("\n⚠️ {count} músicas não couberam no limite da fila."),
     }
-    format!("{minutes}:{seconds:02}")
 }

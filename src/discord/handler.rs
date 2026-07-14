@@ -25,10 +25,11 @@ impl DiscordEventHandler {
     }
 
     async fn synchronize_commands(&self, context: &Context, guild_ids: &[GuildId]) {
+        let language = self.state.config.bot_language;
         let result = self
             .commands_registered
             .get_or_try_init(|| async move {
-                commands::register::synchronize(&context.http, guild_ids).await
+                commands::register::synchronize(&context.http, guild_ids, language).await
             })
             .await;
 

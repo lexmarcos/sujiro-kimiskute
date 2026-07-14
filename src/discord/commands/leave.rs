@@ -4,12 +4,16 @@ use serenity::{
 };
 use tracing::info;
 
-use crate::state::AppState;
+use crate::{localization::BotLanguage, state::AppState};
 
-use super::{respond, respond_app_error};
+use super::{guild_only_message, respond, respond_app_error};
 
-pub fn definition() -> CreateCommand {
-    CreateCommand::new("leave").description("Desconecta o bot do canal de voz")
+pub fn definition(language: BotLanguage) -> CreateCommand {
+    let description = match language {
+        BotLanguage::PtBr => "Desconecta o bot do canal de voz",
+        BotLanguage::EnUs => "Disconnects the bot from the voice channel",
+    };
+    CreateCommand::new("leave").description(description)
 }
 
 pub async fn run(
@@ -17,14 +21,9 @@ pub async fn run(
     command: &CommandInteraction,
     state: &AppState,
 ) -> Result<(), serenity::Error> {
+    let language = state.config.bot_language;
     let Some(guild_id) = command.guild_id else {
-        return respond(
-            context,
-            command,
-            "Este comando só pode ser usado em um servidor.",
-            true,
-        )
-        .await;
+        return respond(context, command, guild_only_message(language), true).await;
     };
     let player = match state
         .voice
@@ -32,11 +31,11 @@ pub async fn run(
         .await
     {
         Ok(player) => player,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
     let result = match state.sessions.leave(player).await {
         Ok(result) => result,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
 
     info!(
@@ -45,5 +44,9 @@ pub async fn run(
         removed_tracks = result.removed_tracks,
         "leave command completed"
     );
-    respond(context, command, "Desconectado do canal de voz.", false).await
+    let message = match language {
+        BotLanguage::PtBr => "Desconectado do canal de voz.",
+        BotLanguage::EnUs => "Disconnected from the voice channel.",
+    };
+    respond(context, command, message, false).await
 }

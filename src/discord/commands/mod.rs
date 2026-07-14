@@ -15,7 +15,7 @@ use serenity::{
 };
 use tracing::{error, info};
 
-use crate::{error::AppError, state::AppState};
+use crate::{error::AppError, localization::BotLanguage, state::AppState};
 
 pub(super) const MAX_RESPONSE_CHARS: usize = 1_899;
 
@@ -31,7 +31,7 @@ pub async fn dispatch(context: &Context, command: &CommandInteraction, state: &A
         respond(
             context,
             command,
-            "🏠 Use este comando dentro de um servidor.",
+            guild_only_message(state.config.bot_language),
             true,
         )
         .await
@@ -63,7 +63,13 @@ async fn dispatch_guild_command(
         "stop" => stop::run(context, command, state).await,
         "queue" => queue::run(context, command, state).await,
         "leave" => leave::run(context, command, state).await,
-        _ => respond(context, command, "❓ Comando não reconhecido.", true).await,
+        _ => {
+            let message = match state.config.bot_language {
+                BotLanguage::PtBr => "❓ Comando não reconhecido.",
+                BotLanguage::EnUs => "❓ Unknown command.",
+            };
+            respond(context, command, message, true).await
+        }
     }
 }
 
@@ -101,6 +107,7 @@ pub(super) fn truncate_text(value: &str, max_chars: usize) -> String {
 pub(super) async fn respond_app_error(
     context: &Context,
     command: &CommandInteraction,
+    language: BotLanguage,
     source: AppError,
 ) -> Result<(), serenity::Error> {
     error!(
@@ -110,5 +117,12 @@ pub(super) async fn respond_app_error(
         error = %source,
         "slash command operation failed"
     );
-    respond(context, command, &source.discord_message(), true).await
+    respond(context, command, &source.discord_message(language), true).await
+}
+
+pub(super) fn guild_only_message(language: BotLanguage) -> &'static str {
+    match language {
+        BotLanguage::PtBr => "🏠 Use este comando dentro de um servidor.",
+        BotLanguage::EnUs => "🏠 Use this command in a server.",
+    }
 }

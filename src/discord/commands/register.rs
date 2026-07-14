@@ -6,6 +6,8 @@ use serenity::{
 use thiserror::Error;
 use tracing::info;
 
+use crate::localization::BotLanguage;
+
 use super::{leave, pause, play, queue, resume, skip, stop};
 
 #[derive(Debug, Error)]
@@ -36,9 +38,10 @@ impl CommandRegistrationError {
 pub async fn synchronize(
     http: &Http,
     guild_ids: &[GuildId],
+    language: BotLanguage,
 ) -> Result<(), CommandRegistrationError> {
     // Clearing first invalidates command IDs still cached by Discord clients.
-    register_global(http).await?;
+    register_global(http, language).await?;
     clear_guilds(http, guild_ids).await
 }
 
@@ -59,8 +62,11 @@ async fn clear_guild(http: &Http, guild_id: GuildId) -> Result<(), CommandRegist
     Ok(())
 }
 
-async fn register_global(http: &Http) -> Result<(), CommandRegistrationError> {
-    let commands: Vec<CreateCommand> = definitions();
+async fn register_global(
+    http: &Http,
+    language: BotLanguage,
+) -> Result<(), CommandRegistrationError> {
+    let commands: Vec<CreateCommand> = definitions(language);
     let registered = Command::set_global_commands(http, commands)
         .await
         .map_err(|source| CommandRegistrationError::RegisterGlobal { source })?;
@@ -72,14 +78,14 @@ async fn register_global(http: &Http) -> Result<(), CommandRegistrationError> {
     Ok(())
 }
 
-fn definitions() -> Vec<CreateCommand> {
+fn definitions(language: BotLanguage) -> Vec<CreateCommand> {
     vec![
-        play::definition(),
-        pause::definition(),
-        resume::definition(),
-        skip::definition(),
-        stop::definition(),
-        queue::definition(),
-        leave::definition(),
+        play::definition(language),
+        pause::definition(language),
+        resume::definition(language),
+        skip::definition(language),
+        stop::definition(language),
+        queue::definition(language),
+        leave::definition(language),
     ]
 }

@@ -7,12 +7,16 @@ use serenity::{
 use tracing::info;
 
 use crate::discord::player_panel::stopped_message;
-use crate::state::AppState;
+use crate::{localization::BotLanguage, state::AppState};
 
-use super::{respond, respond_app_error};
+use super::{guild_only_message, respond, respond_app_error};
 
-pub fn definition() -> CreateCommand {
-    CreateCommand::new("stop").description("Para a reprodução e limpa a fila")
+pub fn definition(language: BotLanguage) -> CreateCommand {
+    let description = match language {
+        BotLanguage::PtBr => "Para a reprodução e limpa a fila",
+        BotLanguage::EnUs => "Stops playback and clears the queue",
+    };
+    CreateCommand::new("stop").description(description)
 }
 
 pub async fn run(
@@ -20,14 +24,9 @@ pub async fn run(
     command: &CommandInteraction,
     state: &AppState,
 ) -> Result<(), serenity::Error> {
+    let language = state.config.bot_language;
     let Some(guild_id) = command.guild_id else {
-        return respond(
-            context,
-            command,
-            "🏠 Use este comando dentro de um servidor.",
-            true,
-        )
-        .await;
+        return respond(context, command, guild_only_message(language), true).await;
     };
     let player = match state
         .voice
@@ -35,11 +34,11 @@ pub async fn run(
         .await
     {
         Ok(player) => player,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
     let stopped = match state.playback.stop(&player).await {
         Ok(stopped) => stopped,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
     state
         .auto_leave
@@ -55,7 +54,7 @@ pub async fn run(
     respond(
         context,
         command,
-        &stopped_message(stopped.removed_tracks),
+        &stopped_message(stopped.removed_tracks, language),
         false,
     )
     .await

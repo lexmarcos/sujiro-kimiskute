@@ -3,12 +3,16 @@ use serenity::{
     builder::CreateCommand,
 };
 
-use crate::{player::playback::PlaybackControlResult, state::AppState};
+use crate::{localization::BotLanguage, player::playback::PlaybackControlResult, state::AppState};
 
-use super::{respond, respond_app_error};
+use super::{guild_only_message, respond, respond_app_error};
 
-pub fn definition() -> CreateCommand {
-    CreateCommand::new("resume").description("Retoma a música atual")
+pub fn definition(language: BotLanguage) -> CreateCommand {
+    let description = match language {
+        BotLanguage::PtBr => "Retoma a música atual",
+        BotLanguage::EnUs => "Resumes the current track",
+    };
+    CreateCommand::new("resume").description(description)
 }
 
 pub async fn run(
@@ -16,14 +20,9 @@ pub async fn run(
     command: &CommandInteraction,
     state: &AppState,
 ) -> Result<(), serenity::Error> {
+    let language = state.config.bot_language;
     let Some(guild_id) = command.guild_id else {
-        return respond(
-            context,
-            command,
-            "🏠 Use este comando dentro de um servidor.",
-            true,
-        )
-        .await;
+        return respond(context, command, guild_only_message(language), true).await;
     };
     let player = match state
         .voice
@@ -31,21 +30,33 @@ pub async fn run(
         .await
     {
         Ok(player) => player,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
     let result = match state.playback.resume(&player).await {
         Ok(result) => result,
-        Err(source) => return respond_app_error(context, command, source).await,
+        Err(source) => return respond_app_error(context, command, language, source).await,
     };
 
-    respond(context, command, response_message(result), false).await
+    respond(context, command, response_message(result, language), false).await
 }
 
-fn response_message(result: PlaybackControlResult) -> &'static str {
-    match result {
-        PlaybackControlResult::Changed => "▶️ Reprodução retomada.",
-        PlaybackControlResult::NoTrack => "🎵 Nenhuma música está tocando agora.",
-        PlaybackControlResult::AlreadyPaused => "⏸️ A reprodução ainda está pausada.",
-        PlaybackControlResult::AlreadyPlaying => "▶️ A reprodução já está tocando.",
+fn response_message(result: PlaybackControlResult, language: BotLanguage) -> &'static str {
+    match (language, result) {
+        (BotLanguage::PtBr, PlaybackControlResult::Changed) => "▶️ Reprodução retomada.",
+        (BotLanguage::PtBr, PlaybackControlResult::NoTrack) => {
+            "🎵 Nenhuma música está tocando agora."
+        }
+        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPaused) => {
+            "⏸️ A reprodução ainda está pausada."
+        }
+        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPlaying) => {
+            "▶️ A reprodução já está tocando."
+        }
+        (BotLanguage::EnUs, PlaybackControlResult::Changed) => "▶️ Playback resumed.",
+        (BotLanguage::EnUs, PlaybackControlResult::NoTrack) => "🎵 No track is playing right now.",
+        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPaused) => "⏸️ Playback is still paused.",
+        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPlaying) => {
+            "▶️ Playback is already playing."
+        }
     }
 }

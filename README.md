@@ -44,6 +44,8 @@ cp .env.example .env
 
 See `.env.example` for optional settings (timeouts, queue size, auto-leave, etc.).
 
+`BOT_LANGUAGE` controls the bot-wide language for command descriptions, responses, embeds, and controls. Supported values are `pt-BR` and `en-US`; when the variable is omitted, the bot defaults to `pt-BR`. Restart the bot after changing the language. Slash command names remain in English in both languages.
+
 ### Run
 
 ```bash

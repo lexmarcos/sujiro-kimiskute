@@ -1,6 +1,7 @@
 pub mod config;
 pub mod discord;
 pub mod error;
+pub mod localization;
 pub mod player;
 pub mod sources;
 pub mod state;
@@ -53,6 +54,7 @@ async fn run_bot() -> Result<(), AppError> {
     let configuration = Arc::new(AppConfig::load()?);
     info!(
         application_id = configuration.discord_application_id,
+        bot_language = %configuration.bot_language,
         "configuration loaded"
     );
 

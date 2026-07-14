@@ -2,7 +2,10 @@ use std::{env, num::ParseIntError, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
+use crate::localization::BotLanguage;
+
 const DEFAULT_AUTO_LEAVE_SECONDS: &str = "120";
+const DEFAULT_BOT_LANGUAGE: &str = "pt-BR";
 const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "4";
 const DEFAULT_MAX_QUEUE_SIZE: &str = "50";
 const DEFAULT_RUST_LOG: &str = "info";
@@ -12,6 +15,7 @@ const DEFAULT_YT_DLP_TIMEOUT_SECONDS: &str = "20";
 pub struct AppConfig {
     pub discord_token: String,
     pub discord_application_id: u64,
+    pub bot_language: BotLanguage,
     pub yt_dlp_path: PathBuf,
     pub yt_dlp_extra_args: Vec<String>,
     pub yt_dlp_timeout: Duration,
@@ -35,6 +39,7 @@ impl AppConfig {
             "DISCORD_APPLICATION_ID",
             required_value("DISCORD_APPLICATION_ID")?,
         )?;
+        let bot_language = configured_bot_language()?;
         let yt_dlp_path = non_empty_value(
             "YT_DLP_PATH",
             optional_value("YT_DLP_PATH", DEFAULT_YT_DLP_PATH)?,
@@ -54,6 +59,7 @@ impl AppConfig {
         Ok(Self {
             discord_token,
             discord_application_id,
+            bot_language,
             yt_dlp_path: PathBuf::from(yt_dlp_path),
             yt_dlp_extra_args,
             yt_dlp_timeout,
@@ -98,6 +104,11 @@ pub enum ConfigError {
 
     #[error("environment variable RUST_LOG contains an invalid tracing filter")]
     InvalidRustLog,
+
+    #[error(
+        "environment variable BOT_LANGUAGE has unsupported value {value:?}; expected pt-BR or en-US"
+    )]
+    InvalidBotLanguage { value: String },
 }
 
 fn load_dotenv() -> Result<(), ConfigError> {
@@ -183,4 +194,9 @@ fn extra_arguments() -> Result<Vec<String>, ConfigError> {
 
 fn configured_rust_log() -> Result<String, ConfigError> {
     non_empty_value("RUST_LOG", optional_value("RUST_LOG", DEFAULT_RUST_LOG)?)
+}
+
+fn configured_bot_language() -> Result<BotLanguage, ConfigError> {
+    let value = optional_value("BOT_LANGUAGE", DEFAULT_BOT_LANGUAGE)?;
+    BotLanguage::parse(&value).ok_or(ConfigError::InvalidBotLanguage { value })
 }

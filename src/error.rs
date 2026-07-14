@@ -49,16 +49,26 @@ impl From<serenity::Error> for AppError {
 impl AppError {
     pub fn discord_message(&self) -> String {
         match self {
-            Self::InvalidInput { .. } => "A entrada informada é inválida.".to_owned(),
-            Self::QueueFull { limit } => format!("A fila está cheia (limite: {limit})."),
+            Self::InvalidInput { .. } => {
+                "⚠️ Não entendi essa entrada. Confira o valor e tente novamente.".to_owned()
+            }
+            Self::QueueFull { limit } => {
+                format!("🚧 A fila está cheia (limite: {limit}). Tente novamente mais tarde.")
+            }
             Self::InvalidVoiceChannel(issue) => issue.discord_message().to_owned(),
-            Self::Timeout { .. } => "A operação demorou demais. Tente novamente.".to_owned(),
-            Self::Resolution { .. } => "Não foi possível encontrar esse conteúdo.".to_owned(),
-            Self::YtDlp { .. } => "Não foi possível preparar esse conteúdo.".to_owned(),
-            Self::Voice { .. } => "Não foi possível controlar o canal de voz.".to_owned(),
-            Self::Discord(_) => "Não foi possível concluir a operação no Discord.".to_owned(),
+            Self::Timeout { .. } => "⏳ A operação demorou demais. Tente novamente.".to_owned(),
+            Self::Resolution { .. } => {
+                "🔎 Não encontrei esse conteúdo no YouTube. Tente outro nome ou link.".to_owned()
+            }
+            Self::YtDlp { .. } => {
+                "⚠️ Não consegui preparar esse conteúdo. Tente outra música.".to_owned()
+            }
+            Self::Voice { .. } => {
+                "🔊 Não consegui controlar o canal de voz. Tente novamente.".to_owned()
+            }
+            Self::Discord(_) => "⚠️ Não consegui concluir a ação no Discord.".to_owned(),
             Self::Configuration(_) | Self::Internal { .. } => {
-                "Ocorreu um erro interno. Tente novamente.".to_owned()
+                "⚠️ Algo deu errado por aqui. Tente novamente.".to_owned()
             }
         }
     }
@@ -79,9 +89,11 @@ pub enum VoiceChannelIssue {
 impl VoiceChannelIssue {
     fn discord_message(&self) -> &'static str {
         match self {
-            Self::UserNotConnected => "Você precisa estar em um canal de voz.",
-            Self::DifferentChannel => "Você precisa estar no mesmo canal de voz que o bot.",
-            Self::Unavailable => "Não foi possível identificar o canal de voz.",
+            Self::UserNotConnected => "🔊 Entre em um canal de voz para controlar a reprodução.",
+            Self::DifferentChannel => {
+                "🔊 Entre no mesmo canal de voz que eu para controlar a reprodução."
+            }
+            Self::Unavailable => "🔊 Não consegui identificar seu canal de voz. Tente novamente.",
         }
     }
 }

@@ -20,7 +20,7 @@ pub async fn run(
         return respond(
             context,
             command,
-            "Este comando só pode ser usado em um servidor.",
+            "🏠 Use este comando dentro de um servidor.",
             true,
         )
         .await;
@@ -43,9 +43,9 @@ pub async fn run(
 
 fn response_message(result: PlaybackControlResult) -> &'static str {
     match result {
-        PlaybackControlResult::Changed => "Reprodução retomada.",
-        PlaybackControlResult::NoTrack => "Nenhuma música está tocando.",
-        PlaybackControlResult::AlreadyPaused => "A reprodução já está pausada.",
-        PlaybackControlResult::AlreadyPlaying => "A reprodução já está tocando.",
+        PlaybackControlResult::Changed => "▶️ Reprodução retomada.",
+        PlaybackControlResult::NoTrack => "🎵 Nenhuma música está tocando agora.",
+        PlaybackControlResult::AlreadyPaused => "⏸️ A reprodução ainda está pausada.",
+        PlaybackControlResult::AlreadyPlaying => "▶️ A reprodução já está tocando.",
     }
 }

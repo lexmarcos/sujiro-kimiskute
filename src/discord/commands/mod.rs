@@ -31,7 +31,7 @@ pub async fn dispatch(context: &Context, command: &CommandInteraction, state: &A
         respond(
             context,
             command,
-            "Este comando só pode ser usado em um servidor.",
+            "🏠 Use este comando dentro de um servidor.",
             true,
         )
         .await
@@ -63,7 +63,7 @@ async fn dispatch_guild_command(
         "stop" => stop::run(context, command, state).await,
         "queue" => queue::run(context, command, state).await,
         "leave" => leave::run(context, command, state).await,
-        _ => respond(context, command, "Comando não reconhecido.", true).await,
+        _ => respond(context, command, "❓ Comando não reconhecido.", true).await,
     }
 }
 

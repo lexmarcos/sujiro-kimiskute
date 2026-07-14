@@ -10,12 +10,6 @@ use super::{leave, pause, play, queue, resume, skip, stop};
 
 #[derive(Debug, Error)]
 pub enum CommandRegistrationError {
-    #[error("failed to clear global application commands: {source}")]
-    ClearGlobal {
-        #[source]
-        source: serenity::Error,
-    },
-
     #[error("failed to clear application commands for guild {guild_id}: {source}")]
     ClearGuild {
         guild_id: GuildId,
@@ -34,26 +28,18 @@ impl CommandRegistrationError {
     pub fn guild_id(&self) -> Option<GuildId> {
         match self {
             Self::ClearGuild { guild_id, .. } => Some(*guild_id),
-            Self::ClearGlobal { .. } | Self::RegisterGlobal { .. } => None,
+            Self::RegisterGlobal { .. } => None,
         }
     }
 }
 
-pub async fn reset_and_register(
+pub async fn synchronize(
     http: &Http,
     guild_ids: &[GuildId],
 ) -> Result<(), CommandRegistrationError> {
-    clear_global(http).await?;
-    clear_guilds(http, guild_ids).await?;
-    register_global(http).await
-}
-
-async fn clear_global(http: &Http) -> Result<(), CommandRegistrationError> {
-    let remaining = Command::set_global_commands(http, Vec::new())
-        .await
-        .map_err(|source| CommandRegistrationError::ClearGlobal { source })?;
-    info!(command_count = remaining.len(), "global commands cleared");
-    Ok(())
+    // Clearing first invalidates command IDs still cached by Discord clients.
+    register_global(http).await?;
+    clear_guilds(http, guild_ids).await
 }
 
 async fn clear_guilds(http: &Http, guild_ids: &[GuildId]) -> Result<(), CommandRegistrationError> {

@@ -28,7 +28,7 @@ impl DiscordEventHandler {
         let result = self
             .commands_registered
             .get_or_try_init(|| async move {
-                commands::register::reset_and_register(&context.http, guild_ids).await
+                commands::register::synchronize(&context.http, guild_ids).await
             })
             .await;
 
@@ -36,7 +36,7 @@ impl DiscordEventHandler {
             error!(
                 guild_id = ?source.guild_id(),
                 error = %source,
-                "failed to reset application commands"
+                "failed to synchronize application commands"
             );
         }
     }

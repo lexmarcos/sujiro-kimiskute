@@ -133,6 +133,7 @@ impl GuildPlayerState {
         let current = self.current.take();
         let removed_from_queue = self.queue.len();
         self.queue.clear();
+        self.history.clear();
         self.playback_state = PlaybackState::Idle;
         self.queue_advancer_active = false;
 

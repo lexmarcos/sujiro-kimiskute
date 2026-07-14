@@ -52,6 +52,24 @@ pub(crate) struct SkippedPlayback {
     pub claimed_advancer: bool,
 }
 
+pub(crate) enum PlaybackSkipClaim {
+    NoTrack,
+    NoNext,
+    Ready(SkippedPlayback),
+}
+
+pub(crate) enum PreviousPlaybackClaim {
+    NoPrevious,
+    Ready(PreviousPlayback),
+}
+
+pub(crate) struct PreviousPlayback {
+    pub track: QueuedTrack,
+    pub operation: PlaybackOperation,
+    pub interrupted_track_id: Option<String>,
+    pub interrupted_handle: Option<TrackHandle>,
+}
+
 pub(crate) struct StoppedPlayback {
     pub track: Option<QueuedTrack>,
     pub handle: Option<TrackHandle>,

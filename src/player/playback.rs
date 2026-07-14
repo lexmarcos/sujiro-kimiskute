@@ -16,7 +16,7 @@ use crate::{
         manager::PlayerManager,
         playback_state::{
             ClaimedPlayback, PlaybackControl, PlaybackControlClaim, PlaybackOperation,
-            PlaybackState,
+            PlaybackSkipClaim, PlaybackState,
         },
         queue::QueueInsertionReceipt,
         track::QueuedTrack,
@@ -24,6 +24,10 @@ use crate::{
     sources::TrackResolver,
     voice::events::{PlaybackEndHandler, PlaybackErrorHandler},
 };
+
+mod previous;
+
+pub use previous::PlaybackPreviousResult;
 
 pub struct PlaybackService {
     resolver: Arc<dyn TrackResolver>,
@@ -105,10 +109,12 @@ impl PlaybackService {
     pub async fn skip(
         self: &Arc<Self>,
         player: Arc<GuildPlayer>,
-    ) -> Result<Option<QueuedTrack>, AppError> {
+    ) -> Result<PlaybackSkipResult, AppError> {
         self.validate_player(&player).await?;
-        let Some(skipped) = player.claim_skip().await? else {
-            return Ok(None);
+        let skipped = match player.claim_skip().await? {
+            PlaybackSkipClaim::NoTrack => return Ok(PlaybackSkipResult::NoTrack),
+            PlaybackSkipClaim::NoNext => return Ok(PlaybackSkipResult::NoNext),
+            PlaybackSkipClaim::Ready(skipped) => skipped,
         };
 
         if let Some(handle) = skipped.handle
@@ -123,10 +129,13 @@ impl PlaybackService {
             );
         }
         if skipped.claimed_advancer {
+            let next = player.take_next_for_advancer().await;
             let playback = Arc::clone(self);
             let advancing_player = Arc::clone(&player);
             tokio::spawn(async move {
-                playback.advance_claimed_queue(advancing_player).await;
+                playback
+                    .advance_claimed_queue_from(advancing_player, next)
+                    .await;
             });
         }
 
@@ -136,7 +145,9 @@ impl PlaybackService {
             playback_id = skipped.operation.playback_id,
             "track skipped"
         );
-        Ok(Some(skipped.track))
+        Ok(PlaybackSkipResult::Skipped {
+            track: skipped.track,
+        })
     }
 
     pub async fn stop(&self, player: &GuildPlayer) -> Result<PlaybackStopResult, AppError> {
@@ -210,8 +221,17 @@ impl PlaybackService {
     }
 
     async fn advance_claimed_queue(self: &Arc<Self>, player: Arc<GuildPlayer>) {
+        let next = player.take_next_for_advancer().await;
+        self.advance_claimed_queue_from(player, next).await;
+    }
+
+    async fn advance_claimed_queue_from(
+        self: &Arc<Self>,
+        player: Arc<GuildPlayer>,
+        mut next: Option<ClaimedPlayback>,
+    ) {
         loop {
-            let Some(claimed) = player.take_next_for_advancer().await else {
+            let Some(claimed) = next.take() else {
                 return;
             };
             let track_id = claimed.track.track.id.clone();
@@ -231,6 +251,7 @@ impl PlaybackService {
                     "queued track failed; advancing queue"
                 ),
             }
+            next = player.take_next_for_advancer().await;
         }
     }
 
@@ -411,6 +432,12 @@ pub enum PlaybackControlResult {
     AlreadyPaused,
     AlreadyPlaying,
     Changed,
+}
+
+pub enum PlaybackSkipResult {
+    NoTrack,
+    NoNext,
+    Skipped { track: QueuedTrack },
 }
 
 pub struct PlaybackStopResult {

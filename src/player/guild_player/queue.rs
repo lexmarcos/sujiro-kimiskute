@@ -127,6 +127,7 @@ impl GuildPlayer {
         }
 
         let current = state.current.take()?;
+        state.record_completed_track(current.track.clone());
         state.playback_state = PlaybackState::Idle;
         let claimed_advancer = state.claim_queue_advancer();
         Some((current.track, claimed_advancer))

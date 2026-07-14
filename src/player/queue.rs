@@ -47,6 +47,11 @@ impl TrackQueue {
         self.tracks.pop_front()
     }
 
+    pub(crate) fn restore_current_to_front(&mut self, track: QueuedTrack) {
+        // Replaying history must not discard a waiting track when the user queue is full.
+        self.tracks.push_front(track);
+    }
+
     pub fn iter(&self) -> vec_deque::Iter<'_, QueuedTrack> {
         self.tracks.iter()
     }
@@ -64,10 +69,10 @@ impl TrackQueue {
     }
 
     pub fn remaining_capacity(&self) -> usize {
-        self.max_size - self.len()
+        self.max_size.saturating_sub(self.len())
     }
 
-    pub fn max_size(&self) -> usize {
+    pub(crate) fn max_size(&self) -> usize {
         self.max_size
     }
 }

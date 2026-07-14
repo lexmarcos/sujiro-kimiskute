@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use serenity::model::id::{ChannelId, GuildId};
 use songbird::tracks::TrackHandle;
 use tokio::sync::{Mutex, Notify};
@@ -46,6 +48,7 @@ struct GuildPlayerState {
     next_voice_operation_id: u64,
     current: Option<CurrentTrack>,
     queue: TrackQueue,
+    history: VecDeque<QueuedTrack>,
     playback_state: PlaybackState,
     session_epoch: u64,
     playback_id: u64,
@@ -70,6 +73,7 @@ impl GuildPlayer {
                 next_voice_operation_id: 0,
                 current: None,
                 queue: TrackQueue::new(max_queue_size)?,
+                history: VecDeque::with_capacity(max_queue_size),
                 playback_state: PlaybackState::Idle,
                 session_epoch: 0,
                 playback_id: 0,
@@ -325,6 +329,13 @@ impl GuildPlayerState {
 
         self.queue_advancer_active = true;
         true
+    }
+
+    fn record_completed_track(&mut self, track: QueuedTrack) {
+        if self.history.len() == self.queue.max_size() {
+            self.history.pop_front();
+        }
+        self.history.push_back(track);
     }
 
     fn current_matches(&self, operation: PlaybackOperation) -> bool {

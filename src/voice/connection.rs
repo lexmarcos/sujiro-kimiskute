@@ -119,25 +119,23 @@ impl VoiceConnection {
         operation: VoiceOperation,
     ) -> Result<Arc<GuildPlayer>, AppError> {
         let guild_id = player.guild_id();
-        let join_result = self.songbird.join(guild_id, operation.channel_id).await;
+        let connection_result = self.join_deafened(guild_id, operation.channel_id).await;
         let is_current = self.player_is_current(&player).await;
         let operation_is_current = player
             .voice_connection_operation_is_current(operation)
             .await;
-        if join_result.is_err() || !is_current || !operation_is_current {
+        if connection_result.is_err() || !is_current || !operation_is_current {
             self.remove_stale_call(guild_id).await;
         }
-        let succeeded = join_result.is_ok() && is_current;
+        let succeeded = connection_result.is_ok() && is_current;
         let confirmed = player
             .finish_voice_connection(operation, succeeded, is_current)
             .await;
 
-        if join_result.is_ok() && (!confirmed || !is_current) {
+        if connection_result.is_ok() && (!confirmed || !is_current) {
             return Err(stale_operation_error("connection"));
         }
-        if let Err(source) = join_result {
-            return Err(voice_error("connect", source));
-        }
+        connection_result?;
         if !confirmed {
             return Err(stale_operation_error("connection"));
         }
@@ -145,9 +143,27 @@ impl VoiceConnection {
         info!(
             guild_id = %guild_id,
             channel_id = %operation.channel_id,
+            self_deafened = true,
             "voice channel connected"
         );
         Ok(player)
+    }
+
+    async fn join_deafened(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<(), AppError> {
+        let call = self
+            .songbird
+            .join(guild_id, channel_id)
+            .await
+            .map_err(|source| voice_error("connect", source))?;
+        call.lock()
+            .await
+            .deafen(true)
+            .await
+            .map_err(|source| deafen_error(guild_id, channel_id, source))
     }
 
     async fn perform_disconnection(
@@ -202,6 +218,14 @@ impl VoiceConnection {
 fn voice_error(operation: &'static str, source: JoinError) -> AppError {
     AppError::Voice {
         context: format!("could not {operation} Songbird voice call: {source}"),
+    }
+}
+
+fn deafen_error(guild_id: GuildId, channel_id: ChannelId, source: JoinError) -> AppError {
+    AppError::Voice {
+        context: format!(
+            "could not deafen Songbird voice call for guild {guild_id} in channel {channel_id}: {source}"
+        ),
     }
 }
 

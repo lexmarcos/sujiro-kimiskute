@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::state::AppState;
 
-use super::{commands, player_controls};
+use super::{commands, player_controls, presence};
 
 pub struct DiscordEventHandler {
     state: Arc<AppState>,
@@ -54,6 +54,9 @@ impl EventHandler for DiscordEventHandler {
             "Discord bot ready"
         );
 
+        context.set_activity(Some(presence::activity_data(
+            &self.state.config.bot_activity,
+        )));
         self.synchronize_commands(&context, &guild_ids).await;
     }
 

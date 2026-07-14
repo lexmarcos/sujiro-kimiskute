@@ -5,6 +5,8 @@ use thiserror::Error;
 use crate::localization::BotLanguage;
 
 const DEFAULT_AUTO_LEAVE_SECONDS: &str = "120";
+const DEFAULT_BOT_ACTIVITY_MESSAGE: &str = "música";
+const DEFAULT_BOT_ACTIVITY_TYPE: &str = "listening";
 const DEFAULT_BOT_LANGUAGE: &str = "pt-BR";
 const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "4";
 const DEFAULT_MAX_QUEUE_SIZE: &str = "50";
@@ -16,6 +18,7 @@ pub struct AppConfig {
     pub discord_token: String,
     pub discord_application_id: u64,
     pub bot_language: BotLanguage,
+    pub(crate) bot_activity: BotActivityConfig,
     pub yt_dlp_path: PathBuf,
     pub yt_dlp_extra_args: Vec<String>,
     pub yt_dlp_timeout: Duration,
@@ -40,6 +43,7 @@ impl AppConfig {
             required_value("DISCORD_APPLICATION_ID")?,
         )?;
         let bot_language = configured_bot_language()?;
+        let bot_activity = configured_bot_activity()?;
         let yt_dlp_path = non_empty_value(
             "YT_DLP_PATH",
             optional_value("YT_DLP_PATH", DEFAULT_YT_DLP_PATH)?,
@@ -60,6 +64,7 @@ impl AppConfig {
             discord_token,
             discord_application_id,
             bot_language,
+            bot_activity,
             yt_dlp_path: PathBuf::from(yt_dlp_path),
             yt_dlp_extra_args,
             yt_dlp_timeout,
@@ -109,6 +114,46 @@ pub enum ConfigError {
         "environment variable BOT_LANGUAGE has unsupported value {value:?}; expected pt-BR or en-US"
     )]
     InvalidBotLanguage { value: String },
+
+    #[error(
+        "environment variable BOT_ACTIVITY_TYPE has unsupported value {value:?}; expected playing, watching, listening, or competing"
+    )]
+    InvalidBotActivityType { value: String },
+}
+
+pub(crate) struct BotActivityConfig {
+    activity_type: BotActivityType,
+    message: String,
+}
+
+impl BotActivityConfig {
+    pub(crate) fn activity_type(&self) -> BotActivityType {
+        self.activity_type
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BotActivityType {
+    Playing,
+    Watching,
+    Listening,
+    Competing,
+}
+
+impl BotActivityType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "playing" => Some(Self::Playing),
+            "watching" => Some(Self::Watching),
+            "listening" => Some(Self::Listening),
+            "competing" => Some(Self::Competing),
+            _ => None,
+        }
+    }
 }
 
 fn load_dotenv() -> Result<(), ConfigError> {
@@ -199,4 +244,22 @@ fn configured_rust_log() -> Result<String, ConfigError> {
 fn configured_bot_language() -> Result<BotLanguage, ConfigError> {
     let value = optional_value("BOT_LANGUAGE", DEFAULT_BOT_LANGUAGE)?;
     BotLanguage::parse(&value).ok_or(ConfigError::InvalidBotLanguage { value })
+}
+
+fn configured_bot_activity() -> Result<BotActivityConfig, ConfigError> {
+    let activity_type_value = optional_value("BOT_ACTIVITY_TYPE", DEFAULT_BOT_ACTIVITY_TYPE)?;
+    let activity_type = BotActivityType::parse(&activity_type_value).ok_or(
+        ConfigError::InvalidBotActivityType {
+            value: activity_type_value,
+        },
+    )?;
+    let message = non_empty_value(
+        "BOT_ACTIVITY_MESSAGE",
+        optional_value("BOT_ACTIVITY_MESSAGE", DEFAULT_BOT_ACTIVITY_MESSAGE)?,
+    )?;
+
+    Ok(BotActivityConfig {
+        activity_type,
+        message,
+    })
 }

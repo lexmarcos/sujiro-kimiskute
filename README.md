@@ -46,6 +46,8 @@ See `.env.example` for optional settings (timeouts, queue size, auto-leave, etc.
 
 `BOT_LANGUAGE` controls the bot-wide language for command descriptions, responses, embeds, and controls. Supported values are `pt-BR` and `en-US`; when the variable is omitted, the bot defaults to `pt-BR`. Restart the bot after changing the language. Slash command names remain in English in both languages.
 
+`BOT_ACTIVITY_TYPE` controls the activity shown in the bot presence. Accepted values are case-sensitive: `playing`, `watching`, `listening`, and `competing`. `BOT_ACTIVITY_MESSAGE` sets the non-empty text displayed beside that activity. They default to `listening` and `música`; restart the bot after changing either value.
+
 ### Run
 
 ```bash

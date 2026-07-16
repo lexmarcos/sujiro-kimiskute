@@ -84,7 +84,10 @@ fn resolved_track(metadata: YoutubeMetadata) -> Result<ResolvedTrack, &'static s
     let id = required_value(metadata.id, "track ID")?;
     let title = required_value(metadata.title, "track title")?;
     let webpage_url = required_value(
-        metadata.webpage_url.or(metadata.original_url),
+        metadata
+            .webpage_url
+            .or(metadata.original_url)
+            .or_else(|| flat_playlist_url(metadata.entry_type.as_deref(), &id)),
         "webpage URL",
     )?;
 
@@ -96,6 +99,16 @@ fn resolved_track(metadata: YoutubeMetadata) -> Result<ResolvedTrack, &'static s
         channel_name: optional_value(metadata.channel.or(metadata.uploader)),
         thumbnail_url: optional_value(metadata.thumbnail),
     })
+}
+
+fn flat_playlist_url(entry_type: Option<&str>, video_id: &str) -> Option<String> {
+    if entry_type != Some("url") {
+        return None;
+    }
+
+    let mut url = Url::parse("https://www.youtube.com/watch").ok()?;
+    url.query_pairs_mut().append_pair("v", video_id);
+    Some(url.to_string())
 }
 
 fn duration_seconds(duration: Option<f64>) -> Option<u64> {

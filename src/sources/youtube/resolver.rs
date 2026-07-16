@@ -149,6 +149,7 @@ fn resolution_arguments(input: &ResolvedInput, max_playlist_size: usize) -> Vec<
             arguments.push(url.clone());
         }
         ResolvedInput::PlaylistUrl(url) => {
+            arguments.push("--flat-playlist".to_owned());
             arguments.push("--playlist-end".to_owned());
             arguments.push(max_playlist_size.to_string());
             arguments.push(url.clone());
@@ -162,7 +163,6 @@ fn base_arguments() -> Vec<String> {
         "--dump-single-json",
         "--no-warnings",
         "--no-progress",
-        "--no-call-home",
         "--skip-download",
         "--format",
         AUDIO_FORMAT,

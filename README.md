@@ -16,6 +16,22 @@ Most people want a Discord bot that plays music. That's it. No web panels, no ly
 
 ## Quick start
 
+### Automated installer
+
+On a 64-bit Linux system, the installer detects x86_64 or ARM64, downloads and
+verifies the matching release, installs `yt-dlp` when needed, and creates the
+`.env` file interactively:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/lexmarcos/sujiro-kimiskute/main/install.sh
+chmod +x install.sh
+./install.sh
+```
+
+The bot is installed under `~/.local/share/sujiro-kimiskute` and its launcher
+under `~/.local/bin` by default. Set `SUJIRO_VERSION`, `SUJIRO_INSTALL_DIR`, or
+`SUJIRO_BIN_DIR` before running the script to override those defaults.
+
 ### Dependencies
 
 ```bash

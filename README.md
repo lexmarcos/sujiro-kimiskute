@@ -83,7 +83,7 @@ docker run --rm --env-file .env sujiro-kimiskute:local
 
 Every setting lives in `.env`. Copy `.env.example` to get started, then fill in `DISCORD_TOKEN` and `DISCORD_APPLICATION_ID`. Everything else is optional (timeouts, queue size, auto-leave, and more).
 
-Two settings are worth knowing:
+Notable settings:
 
 - `BOT_LANGUAGE` sets the language for command descriptions, responses, embeds, and controls. Supported values are `pt-BR` and `en-US`, defaulting to `pt-BR` when omitted. Slash command names stay in English either way.
 - `BOT_ACTIVITY_TYPE` and `BOT_ACTIVITY_MESSAGE` set the presence shown on the bot. The type is case-sensitive and accepts `playing`, `watching`, `listening`, or `competing`. They default to `listening` and `música`.

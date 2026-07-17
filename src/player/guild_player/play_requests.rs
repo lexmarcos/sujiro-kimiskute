@@ -4,10 +4,7 @@ use tracing::info;
 use super::GuildPlayer;
 use crate::{
     error::AppError,
-    player::{
-        play_requests::{PendingPlayRequest, PlayRequestReservation, PlayRequestTicket},
-        track::ResolvedTrack,
-    },
+    player::play_requests::{PendingPlayRequest, PlayRequestReservation, PlayRequestTicket},
 };
 
 impl GuildPlayer {
@@ -32,7 +29,7 @@ impl GuildPlayer {
     pub async fn publish_play_resolution(
         &self,
         reservation: PlayRequestReservation,
-        resolution: Result<Vec<ResolvedTrack>, AppError>,
+        resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
     ) -> bool {
         self.play_requests.publish(reservation, resolution).await
     }

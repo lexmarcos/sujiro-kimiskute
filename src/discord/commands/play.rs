@@ -15,7 +15,7 @@ use crate::{
     player::{
         guild_player::{GuildPlayer, GuildPlayerSnapshot},
         play_requests::{PlayCommitReceipt, PlayRequestReservation, PlayRequestTicket},
-        track::{QueuedTrack, ResolvedTrack},
+        track::QueuedTrack,
     },
     sources::resolver::{MAX_TRACK_INPUT_CHARS, normalize_track_input},
     state::AppState,
@@ -170,7 +170,7 @@ struct CommitRequest {
     reservation: PlayRequestReservation,
     channel_id: ChannelId,
     requested_by: UserId,
-    resolution: Result<Vec<ResolvedTrack>, AppError>,
+    resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
 }
 
 async fn commit_request(
@@ -180,10 +180,14 @@ async fn commit_request(
     request: CommitRequest,
 ) -> Result<PlayCommitReceipt, AppError> {
     validate_commit_state(state, player, request.reservation).await?;
-    let tracks = request.resolution?;
-    let first_track = tracks.first().cloned().ok_or(AppError::Resolution {
-        context: "YouTube resolver returned no tracks".to_owned(),
-    })?;
+    let resolution = request.resolution?;
+    let first_track = resolution
+        .tracks
+        .first()
+        .cloned()
+        .ok_or(AppError::Resolution {
+            context: "YouTube resolver returned no tracks".to_owned(),
+        })?;
 
     revalidate_user_channel(
         cache,
@@ -203,7 +207,9 @@ async fn commit_request(
         request.channel_id,
     )?;
 
-    let queued = tracks
+    let unavailable = resolution.unavailable;
+    let queued = resolution
+        .tracks
         .into_iter()
         .map(|track| QueuedTrack {
             track,
@@ -224,6 +230,7 @@ async fn commit_request(
         requested_by: request.requested_by,
         first_position,
         added: receipt.added,
+        unavailable,
         omitted: receipt.omitted,
     })
 }

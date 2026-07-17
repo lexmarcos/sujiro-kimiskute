@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serenity::model::id::{ChannelId, UserId};
 use tokio::sync::{Mutex, Notify, oneshot};
 
-use crate::{error::AppError, player::track::ResolvedTrack};
+use crate::{error::AppError, player::track::ResolvedTrack, sources::resolver::TrackResolution};
 
 #[derive(Clone, Copy)]
 pub struct PlayRequestReservation {
@@ -20,7 +20,7 @@ pub struct PendingPlayRequest {
     pub reservation: PlayRequestReservation,
     pub channel_id: ChannelId,
     pub requested_by: UserId,
-    pub resolution: Result<Vec<ResolvedTrack>, AppError>,
+    pub resolution: Result<TrackResolution, AppError>,
     pub response: oneshot::Sender<Result<PlayCommitReceipt, AppError>>,
 }
 
@@ -29,6 +29,7 @@ pub struct PlayCommitReceipt {
     pub requested_by: UserId,
     pub first_position: usize,
     pub added: usize,
+    pub unavailable: usize,
     pub omitted: usize,
 }
 
@@ -101,7 +102,7 @@ impl PlayRequestSequencer {
     pub async fn publish(
         &self,
         reservation: PlayRequestReservation,
-        resolution: Result<Vec<ResolvedTrack>, AppError>,
+        resolution: Result<TrackResolution, AppError>,
     ) -> bool {
         {
             let mut state = self.inner.lock().await;

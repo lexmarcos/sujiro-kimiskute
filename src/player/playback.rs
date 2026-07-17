@@ -288,6 +288,20 @@ impl PlaybackService {
                 return Err(error);
             }
         };
+        if let Some(start_at_seconds) = resolved_track.start_at_seconds
+            && let Err(source) = handle
+                .seek_async(Duration::from_secs(start_at_seconds))
+                .await
+        {
+            player.clear_playback(operation).await;
+            stop_created_handle(&handle);
+            return Err(AppError::Voice {
+                context: format!(
+                    "could not seek track {} to {start_at_seconds} seconds: {source}",
+                    resolved_track.id
+                ),
+            });
+        }
         self.start_installed_track(player, operation, &handle)
             .await?;
 

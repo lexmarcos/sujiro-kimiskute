@@ -4,4 +4,4 @@ pub mod handler;
 pub mod play_requests;
 pub mod player_controls;
 pub mod player_panel;
-mod presence;
+pub(crate) mod presence;

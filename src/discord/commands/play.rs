@@ -85,6 +85,7 @@ pub async fn run(
     if let Err(error) = state.auto_leave.cancel_for_activity(&player).await {
         return edit_error(context, command, error, language).await;
     }
+    state.idle_leave.cancel_for_activity(guild_id).await;
     let ticket = match player
         .reserve_play_request(channel_id, command.user.id)
         .await
@@ -121,6 +122,7 @@ pub async fn run(
                 error = %error,
                 "play command failed"
             );
+            state.idle_leave.refresh(guild_id).await;
             edit_error(context, command, error, language).await
         }
     }

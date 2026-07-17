@@ -33,6 +33,7 @@ pub async fn run(
         Ok(player) => player,
         Err(source) => return respond_app_error(context, command, language, source).await,
     };
+    state.idle_leave.cancel_for_activity(guild_id).await;
     let result = match state.sessions.leave(player).await {
         Ok(result) => result,
         Err(source) => return respond_app_error(context, command, language, source).await,

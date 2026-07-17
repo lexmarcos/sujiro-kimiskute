@@ -8,6 +8,7 @@ use crate::{
         guild_player::GuildPlayer,
         lifecycle::{LeaveClaim, LeaveOperation},
         manager::PlayerManager,
+        observer::PlayerObserver,
     },
     voice::VoiceConnection,
 };
@@ -15,11 +16,20 @@ use crate::{
 pub struct GuildSessionService {
     voice: Arc<VoiceConnection>,
     players: Arc<PlayerManager>,
+    observer: tokio::sync::OnceCell<Arc<dyn PlayerObserver>>,
 }
 
 impl GuildSessionService {
     pub fn new(voice: Arc<VoiceConnection>, players: Arc<PlayerManager>) -> Arc<Self> {
-        Arc::new(Self { voice, players })
+        Arc::new(Self {
+            voice,
+            players,
+            observer: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    pub fn initialize_observer(&self, observer: Arc<dyn PlayerObserver>) -> bool {
+        self.observer.set(observer).is_ok()
     }
 
     pub async fn leave(&self, player: Arc<GuildPlayer>) -> Result<LeaveResult, AppError> {
@@ -63,6 +73,9 @@ impl GuildSessionService {
             removed_tracks,
             "guild player session removed"
         );
+        if let Some(observer) = self.observer.get() {
+            observer.player_changed(player.guild_id()).await;
+        }
         Ok(LeaveResult { removed_tracks })
     }
 }

@@ -31,6 +31,8 @@ pub struct GuildPlayerSnapshot {
     pub queued: Vec<QueuedTrack>,
     pub playback_state: PlaybackState,
     pub position_seconds: Option<u64>,
+    pub remaining_known_seconds: u64,
+    pub unknown_duration_tracks: usize,
     pub has_previous: bool,
     pub session_epoch: u64,
     pub playback_id: u64,
@@ -123,6 +125,8 @@ impl GuildPlayer {
                 queued: state.queue.iter().cloned().collect(),
                 playback_state: state.playback_state,
                 position_seconds: None,
+                remaining_known_seconds: remaining_known_seconds(&state),
+                unknown_duration_tracks: unknown_duration_tracks(&state),
                 has_previous: !state.history.is_empty(),
                 session_epoch: state.session_epoch,
                 playback_id: state.playback_id,
@@ -316,6 +320,33 @@ impl GuildPlayer {
         state.playback_state = PlaybackState::Idle;
         Some(current.track)
     }
+}
+
+fn remaining_known_seconds(state: &GuildPlayerState) -> u64 {
+    let current_duration = state
+        .current
+        .as_ref()
+        .and_then(|current| current.track.track.duration_seconds)
+        .unwrap_or(0);
+    let queued_duration = state
+        .queue
+        .iter()
+        .filter_map(|track| track.track.duration_seconds)
+        .fold(0_u64, u64::saturating_add);
+    current_duration.saturating_add(queued_duration)
+}
+
+fn unknown_duration_tracks(state: &GuildPlayerState) -> usize {
+    usize::from(
+        state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.track.track.duration_seconds.is_none()),
+    ) + state
+        .queue
+        .iter()
+        .filter(|track| track.track.duration_seconds.is_none())
+        .count()
 }
 
 impl GuildPlayerState {

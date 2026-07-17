@@ -1,5 +1,6 @@
 pub mod auto_leave;
 pub mod guild_player;
+pub mod idle_leave;
 pub(crate) mod lifecycle;
 pub mod manager;
 pub mod observer;

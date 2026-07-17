@@ -48,7 +48,7 @@ The name is a Japanese-sounding pun on the Portuguese phrase *"Sugiro que me esc
 | `/queue`  | Show the current track and up to 10 coming next         |
 | `/leave`  | Clear the queue, disconnect, and drop the server state  |
 
-`/play` requires you to be in a voice channel. The control commands (`/pause`, `/resume`, `/skip`, `/stop`) require you to be in the same channel as the bot. One session per server. The bot leaves on its own after `AUTO_LEAVE_SECONDS` alone in the channel.
+`/play` requires you to be in a voice channel. The control commands (`/pause`, `/resume`, `/skip`, `/stop`) require you to be in the same channel as the bot. One session per server. The bot leaves on its own after `AUTO_LEAVE_SECONDS` when left alone in the channel.
 
 ## Build from source
 
@@ -87,7 +87,9 @@ Two settings are worth knowing:
 
 - `BOT_LANGUAGE` sets the language for command descriptions, responses, embeds, and controls. Supported values are `pt-BR` and `en-US`, defaulting to `pt-BR` when omitted. Slash command names stay in English either way.
 - `BOT_ACTIVITY_TYPE` and `BOT_ACTIVITY_MESSAGE` set the presence shown on the bot. The type is case-sensitive and accepts `playing`, `watching`, `listening`, or `competing`. They default to `listening` and `música`.
+- `BOT_ACTIVITY_CURRENT_TRACK=true` shows the current title when exactly one server is actively playing. With zero or multiple active servers, the bot uses the configured static activity.
 - `PLAYER_PANEL_UPDATE_SECONDS` controls live playback-progress updates. It defaults to `5`; positive values set the interval in seconds. Set it to `0` to disable the progress display and periodic panel edits while keeping immediate updates for pause, skip, stop, and track changes.
+- `IDLE_LEAVE_SECONDS` disconnects after the queue finishes even if listeners remain. It defaults to 300 seconds; set it to `0` to disable it.
 
 Restart the bot after changing any of these.
 
@@ -98,7 +100,7 @@ Restart the bot after changing any of these.
 - A watch URL containing `list=` plays the selected video; an explicit `/playlist` URL queues the playlist.
 - Playlist requests show loading feedback and can be canceled before they are committed to the queue.
 - The final response reports unavailable playlist entries and tracks omitted by the queue limit.
-- The latest `/play` or `/queue` response becomes the single live player panel and updates as playback changes.
+- The latest `/play` or `/queue` response becomes the single live player panel, shows current and queue timing estimates, and updates as playback changes.
 - If a stream fails, the bot refreshes it once. If recovery also fails, the unavailable track is skipped and the channel is notified.
 
 ## YouTube PO tokens

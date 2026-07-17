@@ -485,6 +485,9 @@ fn now_playing_embed_for_view(
     if let Some(upcoming) = upcoming_tracks_with_limit(&snapshot.queued, limit, include_requester) {
         embed = embed.field(upcoming_field_name(language), upcoming, false);
     }
+    if let Some(estimate) = queue_estimate_label(snapshot, language) {
+        embed = embed.field(queue_estimate_field_name(language), estimate, false);
+    }
     Some(embed)
 }
 
@@ -597,6 +600,53 @@ fn upcoming_line(position: usize, track: &QueuedTrack, include_requester: bool) 
         String::new()
     };
     format!("`{position}.` {title}{duration}{requester}\n")
+}
+
+fn queue_estimate_label(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> Option<String> {
+    if snapshot.current.is_none() && snapshot.queued.is_empty() {
+        return None;
+    }
+    let current_position = snapshot.position_seconds.unwrap_or(0);
+    let current_duration_is_known = snapshot
+        .current
+        .as_ref()
+        .is_some_and(|current| current.track.duration_seconds.is_some());
+    let remaining_known = if current_duration_is_known {
+        snapshot
+            .remaining_known_seconds
+            .saturating_sub(current_position)
+    } else {
+        snapshot.remaining_known_seconds
+    };
+    let mut label = match language {
+        BotLanguage::PtBr => format!("Restante conhecido: `{}`", format_duration(remaining_known)),
+        BotLanguage::EnUs => format!("Known remaining: `{}`", format_duration(remaining_known)),
+    };
+    if snapshot.unknown_duration_tracks > 0 {
+        let unknown = match (language, snapshot.unknown_duration_tracks) {
+            (BotLanguage::PtBr, 1) => "1 música com duração desconhecida".to_owned(),
+            (BotLanguage::PtBr, count) => {
+                format!("{count} músicas com duração desconhecida")
+            }
+            (BotLanguage::EnUs, 1) => "1 track with unknown duration".to_owned(),
+            (BotLanguage::EnUs, count) => {
+                format!("{count} tracks with unknown duration")
+            }
+        };
+        label.push_str(" · ");
+        label.push_str(&unknown);
+        return Some(label);
+    }
+    if snapshot.playback_state == PlaybackState::Playing
+        && let Some(end_timestamp) = unix_timestamp_after(remaining_known)
+    {
+        let prefix = match language {
+            BotLanguage::PtBr => "Fila termina",
+            BotLanguage::EnUs => "Queue ends",
+        };
+        label.push_str(&format!("\n{prefix} <t:{end_timestamp}:R>"));
+    }
+    Some(label)
 }
 
 fn progress_label(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> Option<String> {
@@ -728,6 +778,13 @@ fn unavailable_channel(language: BotLanguage) -> &'static str {
     match language {
         BotLanguage::PtBr => "Não informado",
         BotLanguage::EnUs => "Not provided",
+    }
+}
+
+fn queue_estimate_field_name(language: BotLanguage) -> &'static str {
+    match language {
+        BotLanguage::PtBr => "Fila",
+        BotLanguage::EnUs => "Queue",
     }
 }
 

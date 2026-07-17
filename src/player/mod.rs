@@ -2,6 +2,7 @@ pub mod auto_leave;
 pub mod guild_player;
 pub(crate) mod lifecycle;
 pub mod manager;
+pub mod observer;
 pub mod play_requests;
 pub mod playback;
 pub(crate) mod playback_state;

@@ -16,12 +16,18 @@ pub async fn build_client(state: Arc<AppState>) -> Result<Client, AppError> {
     let intents: GatewayIntents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let application_id: ApplicationId = ApplicationId::new(state.config.discord_application_id);
 
-    Client::builder(&state.config.discord_token, intents)
+    let client = Client::builder(&state.config.discord_token, intents)
         .application_id(application_id)
         .event_handler(DiscordEventHandler::new(Arc::clone(&state)))
         .register_songbird_with(Arc::clone(&state.songbird))
         .await
-        .map_err(AppError::from)
+        .map_err(AppError::from)?;
+    if !state.player_panels.initialize(Arc::clone(&client.http)) {
+        return Err(AppError::Internal {
+            context: "player panel HTTP client was already initialized".to_owned(),
+        });
+    }
+    Ok(client)
 }
 
 pub async fn run_until_shutdown(mut client: Client) -> Result<(), AppError> {

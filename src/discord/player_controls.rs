@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use serenity::{
     all::{ComponentInteraction, Context, GuildId},
-    builder::{EditInteractionResponse, EditMessage},
+    builder::EditInteractionResponse,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
     error::AppError,
@@ -21,8 +21,7 @@ use crate::{
 use super::{
     commands::truncate_text,
     player_panel::{
-        PREVIOUS_CONTROL_ID, SKIP_CONTROL_ID, STOP_CONTROL_ID, TOGGLE_CONTROL_ID, control_row,
-        disabled_control_row, now_playing_embed, now_playing_message, stopped_message,
+        PREVIOUS_CONTROL_ID, SKIP_CONTROL_ID, STOP_CONTROL_ID, TOGGLE_CONTROL_ID, stopped_message,
     },
 };
 
@@ -38,7 +37,6 @@ enum PlayerControl {
 
 struct ControlOutcome {
     feedback: String,
-    idle_panel_message: &'static str,
 }
 
 pub async fn dispatch(
@@ -58,8 +56,10 @@ pub async fn dispatch(
     let language = state.config.bot_language;
     let result = run_control(context, interaction, state, control, language).await;
     match result {
-        Ok((outcome, player)) => {
-            refresh_panel(context, interaction, &player, &outcome, language).await;
+        Ok((outcome, _player)) => {
+            if let Some(guild_id) = interaction.guild_id {
+                state.player_panels.refresh(guild_id).await;
+            }
             edit_feedback(context, interaction, &outcome.feedback, control).await;
             info!(
                 guild_id = ?interaction.guild_id,
@@ -134,7 +134,7 @@ async fn previous(
             format!("⏮️ Going back to **{}**.", feedback_title(&track))
         }
     };
-    Ok(ControlOutcome::active(feedback, language))
+    Ok(ControlOutcome { feedback })
 }
 
 async fn toggle(
@@ -148,10 +148,9 @@ async fn toggle(
     } else {
         state.playback.pause(player).await?
     };
-    Ok(ControlOutcome::active(
-        toggle_feedback(result, was_paused, language),
-        language,
-    ))
+    Ok(ControlOutcome {
+        feedback: toggle_feedback(result, was_paused, language),
+    })
 }
 
 async fn skip(
@@ -180,18 +179,7 @@ async fn skip(
             format!("⏭️ Skipped **{}**.", feedback_title(&track))
         }
     };
-    let idle_panel_message = match language {
-        BotLanguage::PtBr => {
-            "⏭️ Música pulada. A próxima faixa está sendo preparada. Use `/queue` para atualizar."
-        }
-        BotLanguage::EnUs => {
-            "⏭️ Track skipped. The next track is being prepared. Use `/queue` to refresh."
-        }
-    };
-    Ok(ControlOutcome {
-        feedback,
-        idle_panel_message,
-    })
+    Ok(ControlOutcome { feedback })
 }
 
 async fn stop(
@@ -206,47 +194,9 @@ async fn stop(
         .auto_leave
         .refresh(Arc::clone(&context.cache), guild_id)
         .await;
-    let idle_panel_message = match language {
-        BotLanguage::PtBr => "⏹️ Reprodução encerrada e fila limpa.",
-        BotLanguage::EnUs => "⏹️ Playback stopped and queue cleared.",
-    };
     Ok(ControlOutcome {
         feedback: stopped_message(stopped.removed_tracks, language),
-        idle_panel_message,
     })
-}
-
-async fn refresh_panel(
-    context: &Context,
-    interaction: &ComponentInteraction,
-    player: &GuildPlayer,
-    outcome: &ControlOutcome,
-    language: BotLanguage,
-) {
-    let snapshot = player.snapshot().await;
-    let builder = match now_playing_embed(&snapshot, language) {
-        Some(embed) => EditMessage::new()
-            .content(now_playing_message(language))
-            .embed(embed)
-            .components(vec![control_row(&snapshot, language)]),
-        None => EditMessage::new()
-            .content(outcome.idle_panel_message)
-            .embeds(Vec::new())
-            .components(vec![disabled_control_row(&snapshot, language)]),
-    };
-    if let Err(source) = interaction
-        .channel_id
-        .edit_message(&context.http, interaction.message.id, builder)
-        .await
-    {
-        warn!(
-            guild_id = ?interaction.guild_id,
-            user_id = %interaction.user.id,
-            control = %interaction.data.custom_id,
-            error = %source,
-            "failed to refresh player control panel"
-        );
-    }
 }
 
 async fn respond_error(
@@ -355,19 +305,6 @@ fn log_discord_error(
         operation,
         "player control Discord response failed"
     );
-}
-
-impl ControlOutcome {
-    fn active(feedback: String, language: BotLanguage) -> Self {
-        let idle_panel_message = match language {
-            BotLanguage::PtBr => "🎵 Não há uma música tocando agora. Use `/queue` para atualizar.",
-            BotLanguage::EnUs => "🎵 No track is playing right now. Use `/queue` to refresh.",
-        };
-        Self {
-            feedback,
-            idle_panel_message,
-        }
-    }
 }
 
 impl PlayerControl {

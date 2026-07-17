@@ -27,7 +27,7 @@ use crate::{
 use super::{MAX_RESPONSE_CHARS, guild_only_message, respond, respond_app_error, truncate_text};
 use crate::discord::{
     play_requests::CANCEL_PLAY_PREFIX,
-    player_panel::{control_row, format_duration, now_playing_embed},
+    player_panel::{PanelView, control_row, format_duration, now_playing_embed},
 };
 
 const MAX_TITLE_CHARS: usize = 160;
@@ -99,7 +99,12 @@ pub async fn run(
     match commit {
         Ok(receipt) => {
             let snapshot = player.snapshot().await;
-            edit_success(context, command, receipt, &snapshot, language).await
+            let message = edit_success(context, command, receipt, &snapshot, language).await?;
+            state
+                .player_panels
+                .register(guild_id, message.channel_id, message.id, PanelView::Compact)
+                .await;
+            Ok(())
         }
         Err(error) => {
             error!(
@@ -363,7 +368,7 @@ async fn edit_success(
     receipt: PlayCommitReceipt,
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
-) -> Result<(), serenity::Error> {
+) -> Result<serenity::all::Message, serenity::Error> {
     let response = match now_playing_embed(snapshot, language) {
         Some(embed) => EditInteractionResponse::new()
             .content(success_message(&receipt, language))
@@ -373,8 +378,7 @@ async fn edit_success(
             .content(success_message(&receipt, language))
             .components(Vec::new()),
     };
-    command.edit_response(&context.http, response).await?;
-    Ok(())
+    command.edit_response(&context.http, response).await
 }
 
 async fn edit_error(

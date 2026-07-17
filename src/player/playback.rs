@@ -14,6 +14,7 @@ use crate::{
     player::{
         guild_player::GuildPlayer,
         manager::PlayerManager,
+        observer::PlayerObserver,
         playback_state::{
             ClaimedPlayback, PlaybackControl, PlaybackControlClaim, PlaybackOperation,
             PlaybackSkipClaim, PlaybackState,
@@ -34,6 +35,7 @@ pub struct PlaybackService {
     http_client: Client,
     songbird: Arc<Songbird>,
     players: Arc<PlayerManager>,
+    observer: Arc<dyn PlayerObserver>,
 }
 
 impl PlaybackService {
@@ -42,12 +44,14 @@ impl PlaybackService {
         http_client: Client,
         songbird: Arc<Songbird>,
         players: Arc<PlayerManager>,
+        observer: Arc<dyn PlayerObserver>,
     ) -> Arc<Self> {
         Arc::new(Self {
             resolver,
             http_client,
             songbird,
             players,
+            observer,
         })
     }
 
@@ -73,6 +77,7 @@ impl PlaybackService {
         if claimed_advancer {
             self.advance_claimed_queue(Arc::clone(&player)).await;
         }
+        self.observer.player_changed(player.guild_id()).await;
         Ok(position)
     }
 
@@ -89,6 +94,7 @@ impl PlaybackService {
         if claimed_advancer {
             self.advance_claimed_queue(Arc::clone(&player)).await;
         }
+        self.observer.player_changed(player.guild_id()).await;
         Ok(receipt)
     }
 
@@ -145,6 +151,7 @@ impl PlaybackService {
             playback_id = skipped.operation.playback_id,
             "track skipped"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(PlaybackSkipResult::Skipped {
             track: skipped.track,
         })
@@ -173,6 +180,7 @@ impl PlaybackService {
             removed_from_queue = stopped.removed_from_queue,
             "playback stopped and queue cleared"
         );
+        self.observer.player_changed(player.guild_id()).await;
 
         Ok(PlaybackStopResult { removed_tracks })
     }
@@ -217,6 +225,7 @@ impl PlaybackService {
             operation = operation_name,
             "track playback state changed"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(PlaybackControlResult::Changed)
     }
 
@@ -311,6 +320,7 @@ impl PlaybackService {
             playback_id = operation.playback_id,
             "track playback started"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(())
     }
 
@@ -411,6 +421,7 @@ impl PlaybackService {
             playback_id = operation.playback_id,
             "track playback ended"
         );
+        self.observer.player_changed(guild_id).await;
 
         if claimed_advancer {
             let playback = Arc::clone(self);

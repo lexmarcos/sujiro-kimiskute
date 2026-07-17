@@ -24,6 +24,9 @@ pub enum AppError {
     #[error("invalid input: {reason}")]
     InvalidInput { reason: String },
 
+    #[error("{operation} was canceled")]
+    Canceled { operation: &'static str },
+
     #[error("queue is full (limit: {limit})")]
     QueueFull { limit: usize },
 
@@ -59,6 +62,7 @@ impl AppError {
             Self::InvalidInput { .. } => {
                 "⚠️ Não entendi essa entrada. Confira o valor e tente novamente.".to_owned()
             }
+            Self::Canceled { .. } => "🚫 Pedido cancelado.".to_owned(),
             Self::QueueFull { limit } => {
                 format!("🚧 A fila está cheia (limite: {limit}). Tente novamente mais tarde.")
             }
@@ -85,6 +89,7 @@ impl AppError {
             Self::InvalidInput { .. } => {
                 "⚠️ I couldn't understand that input. Check the value and try again.".to_owned()
             }
+            Self::Canceled { .. } => "🚫 Request canceled.".to_owned(),
             Self::QueueFull { limit } => {
                 format!("🚧 The queue is full (limit: {limit}). Try again later.")
             }

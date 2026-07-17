@@ -5,7 +5,9 @@ use serenity::{
         Cache, ChannelId, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
         GuildId, UserId,
     },
-    builder::{CreateCommand, CreateCommandOption, EditInteractionResponse},
+    builder::{
+        CreateActionRow, CreateButton, CreateCommand, CreateCommandOption, EditInteractionResponse,
+    },
 };
 use tracing::error;
 
@@ -17,13 +19,16 @@ use crate::{
         play_requests::{PlayCommitReceipt, PlayRequestReservation, PlayRequestTicket},
         track::QueuedTrack,
     },
-    sources::resolver::{MAX_TRACK_INPUT_CHARS, normalize_track_input},
+    sources::resolver::{MAX_TRACK_INPUT_CHARS, TrackInputKind, normalize_track_input},
     state::AppState,
     voice::VoiceConnection,
 };
 
 use super::{MAX_RESPONSE_CHARS, guild_only_message, respond, respond_app_error, truncate_text};
-use crate::discord::player_panel::{control_row, format_duration, now_playing_embed};
+use crate::discord::{
+    play_requests::CANCEL_PLAY_PREFIX,
+    player_panel::{control_row, format_duration, now_playing_embed},
+};
 
 const MAX_TITLE_CHARS: usize = 160;
 
@@ -69,6 +74,10 @@ pub async fn run(
     };
 
     command.defer(&context.http).await?;
+    let input_kind = match state.track_resolver.classify(&query) {
+        Ok(input_kind) => input_kind,
+        Err(error) => return edit_error(context, command, error, language).await,
+    };
     let player = match state.players.get_or_create(guild_id).await {
         Ok(player) => player,
         Err(error) => return edit_error(context, command, error, language).await,
@@ -83,7 +92,8 @@ pub async fn run(
         Ok(ticket) => ticket,
         Err(error) => return edit_error(context, command, error, language).await,
     };
-    spawn_resolution(context, state, &player, ticket.reservation, query);
+    edit_loading(context, command, ticket.reservation, input_kind, language).await?;
+    spawn_resolution(context, state, &player, ticket.reservation, query).await;
     let commit = wait_for_commit(ticket).await;
 
     match commit {
@@ -103,7 +113,7 @@ pub async fn run(
     }
 }
 
-fn spawn_resolution(
+async fn spawn_resolution(
     context: &Context,
     state: &Arc<AppState>,
     player: &Arc<GuildPlayer>,
@@ -112,18 +122,26 @@ fn spawn_resolution(
 ) {
     let resolver = Arc::clone(&state.track_resolver);
     let resolution_task = tokio::spawn(async move { resolver.resolve(&query).await });
+    if !player
+        .install_play_request_abort(reservation, resolution_task.abort_handle())
+        .await
+    {
+        return;
+    }
     let cache = Arc::clone(&context.cache);
     let state = Arc::clone(state);
     let weak_player = Arc::downgrade(player);
     drop(tokio::spawn(async move {
-        let resolution = resolution_task.await.unwrap_or_else(|source| {
-            Err(AppError::Internal {
+        let resolution = match resolution_task.await {
+            Ok(resolution) => resolution,
+            Err(source) if source.is_cancelled() => return,
+            Err(source) => Err(AppError::Internal {
                 context: format!(
                     "play resolution task for sequence {} failed: {source}",
                     reservation.sequence
                 ),
-            })
-        });
+            }),
+        };
         let Some(player) = weak_player.upgrade() else {
             return;
         };
@@ -136,6 +154,47 @@ fn spawn_resolution(
     }));
 }
 
+async fn edit_loading(
+    context: &Context,
+    command: &CommandInteraction,
+    reservation: PlayRequestReservation,
+    input_kind: TrackInputKind,
+    language: BotLanguage,
+) -> Result<(), serenity::Error> {
+    let content = loading_message(input_kind, language);
+    let mut response = EditInteractionResponse::new().content(content);
+    if input_kind == TrackInputKind::Collection {
+        let custom_id = format!(
+            "{CANCEL_PLAY_PREFIX}{}:{}",
+            reservation.sequence, reservation.session_epoch
+        );
+        let label = match language {
+            BotLanguage::PtBr => "Cancelar",
+            BotLanguage::EnUs => "Cancel",
+        };
+        response = response.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(custom_id)
+                .label(label)
+                .style(serenity::all::ButtonStyle::Secondary),
+        ])]);
+    }
+    command.edit_response(&context.http, response).await?;
+    Ok(())
+}
+
+fn loading_message(input_kind: TrackInputKind, language: BotLanguage) -> &'static str {
+    match (language, input_kind) {
+        (BotLanguage::PtBr, TrackInputKind::Collection) => {
+            "⏳ Carregando a playlist e verificando as músicas…"
+        }
+        (BotLanguage::PtBr, _) => "⏳ Procurando e preparando a música…",
+        (BotLanguage::EnUs, TrackInputKind::Collection) => {
+            "⏳ Loading the playlist and checking its tracks…"
+        }
+        (BotLanguage::EnUs, _) => "⏳ Finding and preparing the track…",
+    }
+}
+
 async fn wait_for_commit(ticket: PlayRequestTicket) -> Result<PlayCommitReceipt, AppError> {
     ticket.response.await.map_err(|_| AppError::Internal {
         context: format!(
@@ -145,7 +204,11 @@ async fn wait_for_commit(ticket: PlayRequestTicket) -> Result<PlayCommitReceipt,
     })?
 }
 
-async fn drain_ready_requests(cache: Arc<Cache>, state: Arc<AppState>, player: Arc<GuildPlayer>) {
+pub(crate) async fn drain_ready_requests(
+    cache: Arc<Cache>,
+    state: Arc<AppState>,
+    player: Arc<GuildPlayer>,
+) {
     while let Some(request) = player.take_next_play_request().await {
         let sequence = request.reservation.sequence;
         let response = request.response;
@@ -306,7 +369,9 @@ async fn edit_success(
             .content(success_message(&receipt, language))
             .embed(embed)
             .components(vec![control_row(snapshot, language)]),
-        None => EditInteractionResponse::new().content(success_message(&receipt, language)),
+        None => EditInteractionResponse::new()
+            .content(success_message(&receipt, language))
+            .components(Vec::new()),
     };
     command.edit_response(&context.http, response).await?;
     Ok(())
@@ -321,7 +386,9 @@ async fn edit_error(
     command
         .edit_response(
             &context.http,
-            EditInteractionResponse::new().content(error.discord_message(language)),
+            EditInteractionResponse::new()
+                .content(error.discord_message(language))
+                .components(Vec::new()),
         )
         .await?;
     Ok(())
@@ -336,38 +403,59 @@ fn success_message(receipt: &PlayCommitReceipt, language: BotLanguage) -> String
     let requester = format!("<@{}>", receipt.requested_by);
     let title = truncate_text(&receipt.first_track.title, MAX_TITLE_CHARS);
 
-    let omitted = omitted_message(receipt.omitted, language);
+    let notes = resolution_notes(receipt.unavailable, receipt.omitted, language);
     let message = match (language, receipt.added) {
         (BotLanguage::PtBr, 1) => format!(
-            "✅ **{title}** adicionada à fila{duration}.\n📍 Posição: **{}** · Solicitada por {requester}{omitted}",
+            "✅ **{title}** adicionada à fila{duration}.\n📍 Posição: **{}** · Solicitada por {requester}{notes}",
             receipt.first_position
         ),
         (BotLanguage::PtBr, _) => format!(
-            "✅ **{} músicas** adicionadas à fila.\n🎵 Primeira: **{title}**{duration}\n📍 Começa na posição **{}** · Solicitada por {requester}{omitted}",
+            "✅ **{} músicas** adicionadas à fila.\n🎵 Primeira: **{title}**{duration}\n📍 Começa na posição **{}** · Solicitada por {requester}{notes}",
             receipt.added, receipt.first_position
         ),
         (BotLanguage::EnUs, 1) => format!(
-            "✅ **{title}** added to the queue{duration}.\n📍 Position: **{}** · Requested by {requester}{omitted}",
+            "✅ **{title}** added to the queue{duration}.\n📍 Position: **{}** · Requested by {requester}{notes}",
             receipt.first_position
         ),
         (BotLanguage::EnUs, _) => format!(
-            "✅ **{} tracks** added to the queue.\n🎵 First: **{title}**{duration}\n📍 Starts at position **{}** · Requested by {requester}{omitted}",
+            "✅ **{} tracks** added to the queue.\n🎵 First: **{title}**{duration}\n📍 Starts at position **{}** · Requested by {requester}{notes}",
             receipt.added, receipt.first_position
         ),
     };
     truncate_text(&message, MAX_RESPONSE_CHARS)
 }
 
-fn omitted_message(omitted: usize, language: BotLanguage) -> String {
-    match (language, omitted) {
-        (_, 0) => String::new(),
-        (BotLanguage::PtBr, 1) => "\n⚠️ 1 música não coube no limite da fila.".to_owned(),
-        (BotLanguage::PtBr, count) => {
-            format!("\n⚠️ {count} músicas não couberam no limite da fila.")
-        }
-        (BotLanguage::EnUs, 1) => "\n⚠️ 1 track did not fit within the queue limit.".to_owned(),
-        (BotLanguage::EnUs, count) => {
-            format!("\n⚠️ {count} tracks did not fit within the queue limit.")
-        }
+fn resolution_notes(unavailable: usize, omitted: usize, language: BotLanguage) -> String {
+    let mut notes = String::new();
+    if unavailable > 0 {
+        let message = match (language, unavailable) {
+            (BotLanguage::PtBr, 1) => "1 música indisponível foi ignorada".to_owned(),
+            (BotLanguage::PtBr, count) => {
+                format!("{count} músicas indisponíveis foram ignoradas")
+            }
+            (BotLanguage::EnUs, 1) => "1 unavailable track was skipped".to_owned(),
+            (BotLanguage::EnUs, count) => {
+                format!("{count} unavailable tracks were skipped")
+            }
+        };
+        notes.push_str("\n⚠️ ");
+        notes.push_str(&message);
+        notes.push('.');
     }
+    if omitted > 0 {
+        let message = match (language, omitted) {
+            (BotLanguage::PtBr, 1) => "1 música não coube no limite da fila".to_owned(),
+            (BotLanguage::PtBr, count) => {
+                format!("{count} músicas não couberam no limite da fila")
+            }
+            (BotLanguage::EnUs, 1) => "1 track did not fit within the queue limit".to_owned(),
+            (BotLanguage::EnUs, count) => {
+                format!("{count} tracks did not fit within the queue limit")
+            }
+        };
+        notes.push_str("\n⚠️ ");
+        notes.push_str(&message);
+        notes.push('.');
+    }
+    notes
 }

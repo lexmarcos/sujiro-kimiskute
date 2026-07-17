@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use serenity::model::id::{ChannelId, UserId};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::{
+    sync::{Mutex, Notify, oneshot},
+    task::AbortHandle,
+};
 
 use crate::{error::AppError, player::track::ResolvedTrack, sources::resolver::TrackResolution};
 
@@ -33,6 +36,12 @@ pub struct PlayCommitReceipt {
     pub omitted: usize,
 }
 
+pub enum PlayRequestCancellation {
+    Canceled { should_drain: bool },
+    Forbidden,
+    NotFound,
+}
+
 pub struct PlayRequestSequencer {
     inner: Mutex<SequencerState>,
     changed: Notify,
@@ -54,6 +63,12 @@ struct ReservedPlayRequest {
     reservation: PlayRequestReservation,
     channel_id: ChannelId,
     requested_by: UserId,
+    abort_handle: Option<AbortHandle>,
+    response: oneshot::Sender<Result<PlayCommitReceipt, AppError>>,
+}
+
+struct CanceledPlayRequest {
+    abort_handle: Option<AbortHandle>,
     response: oneshot::Sender<Result<PlayCommitReceipt, AppError>>,
 }
 
@@ -90,6 +105,7 @@ impl PlayRequestSequencer {
                 reservation,
                 channel_id,
                 requested_by,
+                abort_handle: None,
                 response,
             }),
         );
@@ -97,6 +113,25 @@ impl PlayRequestSequencer {
             reservation,
             response: receiver,
         }
+    }
+
+    pub async fn install_abort_handle(
+        &self,
+        reservation: PlayRequestReservation,
+        abort_handle: AbortHandle,
+    ) -> bool {
+        let mut state = self.inner.lock().await;
+        let Some(PlayRequestSlot::Resolving(request)) = state.slots.get_mut(&reservation.sequence)
+        else {
+            abort_handle.abort();
+            return false;
+        };
+        if request.reservation.session_epoch != reservation.session_epoch {
+            abort_handle.abort();
+            return false;
+        }
+        request.abort_handle = Some(abort_handle);
+        true
     }
 
     pub async fn publish(
@@ -134,6 +169,37 @@ impl PlayRequestSequencer {
         self.wait_for_drain_role(reservation.sequence).await
     }
 
+    pub async fn cancel(
+        &self,
+        reservation: PlayRequestReservation,
+        requested_by: UserId,
+    ) -> PlayRequestCancellation {
+        let (canceled, should_drain) = {
+            let mut state = self.inner.lock().await;
+            let Some(slot) = state.slots.get(&reservation.sequence) else {
+                return PlayRequestCancellation::NotFound;
+            };
+            if slot.session_epoch() != reservation.session_epoch {
+                return PlayRequestCancellation::NotFound;
+            }
+            if slot.requested_by() != requested_by {
+                return PlayRequestCancellation::Forbidden;
+            }
+
+            let Some(slot) = state.slots.remove(&reservation.sequence) else {
+                return PlayRequestCancellation::NotFound;
+            };
+            state.advance_over_gaps();
+            let should_drain = state.start_draining_if_ready();
+            (slot.into_canceled(), should_drain)
+        };
+        self.changed.notify_waiters();
+        canceled.finish(AppError::Canceled {
+            operation: "play request",
+        });
+        PlayRequestCancellation::Canceled { should_drain }
+    }
+
     pub async fn take_next(&self) -> Option<PendingPlayRequest> {
         let mut state = self.inner.lock().await;
         let next_commit = state.next_commit;
@@ -148,7 +214,7 @@ impl PlayRequestSequencer {
     }
 
     pub async fn invalidate_before_epoch(&self, current_epoch: u64) -> usize {
-        let responses = {
+        let canceled = {
             let mut state = self.inner.lock().await;
             let obsolete_sequences: Vec<u64> = state
                 .slots
@@ -157,20 +223,20 @@ impl PlayRequestSequencer {
                     (slot.session_epoch() != current_epoch).then_some(*sequence)
                 })
                 .collect();
-            let responses: Vec<_> = obsolete_sequences
+            let canceled: Vec<_> = obsolete_sequences
                 .into_iter()
                 .filter_map(|sequence| state.slots.remove(&sequence))
-                .map(PlayRequestSlot::response)
+                .map(PlayRequestSlot::into_canceled)
                 .collect();
             state.advance_over_gaps();
-            responses
+            canceled
         };
         self.changed.notify_waiters();
-        let canceled = responses.len();
-        for response in responses {
-            let _ = response.send(Err(session_changed_error(current_epoch)));
+        let canceled_count = canceled.len();
+        for request in canceled {
+            request.finish(session_changed_error(current_epoch));
         }
-        canceled
+        canceled_count
     }
 
     async fn wait_for_drain_role(&self, sequence: u64) -> bool {
@@ -229,11 +295,33 @@ impl PlayRequestSlot {
         }
     }
 
-    fn response(self) -> oneshot::Sender<Result<PlayCommitReceipt, AppError>> {
+    fn requested_by(&self) -> UserId {
         match self {
-            Self::Resolving(request) => request.response,
-            Self::Ready(request) => request.response,
+            Self::Resolving(request) => request.requested_by,
+            Self::Ready(request) => request.requested_by,
         }
+    }
+
+    fn into_canceled(self) -> CanceledPlayRequest {
+        match self {
+            Self::Resolving(request) => CanceledPlayRequest {
+                abort_handle: request.abort_handle,
+                response: request.response,
+            },
+            Self::Ready(request) => CanceledPlayRequest {
+                abort_handle: None,
+                response: request.response,
+            },
+        }
+    }
+}
+
+impl CanceledPlayRequest {
+    fn finish(self, error: AppError) {
+        if let Some(abort_handle) = self.abort_handle {
+            abort_handle.abort();
+        }
+        let _ = self.response.send(Err(error));
     }
 }
 

@@ -40,7 +40,7 @@ The name is a Japanese-sounding pun on the Portuguese phrase *"Sugiro que me esc
 
 | Command   | What it does                                             |
 | --------- | ------------------------------------------------------- |
-| `/play`   | Play from a YouTube search, a video URL, or a playlist  |
+| `/play`   | Search, YouTube/YouTube Music video, Short, or playlist |
 | `/pause`  | Pause the current track                                 |
 | `/resume` | Resume playback                                         |
 | `/skip`   | Skip to the next track                                  |
@@ -89,6 +89,16 @@ Two settings are worth knowing:
 - `BOT_ACTIVITY_TYPE` and `BOT_ACTIVITY_MESSAGE` set the presence shown on the bot. The type is case-sensitive and accepts `playing`, `watching`, `listening`, or `competing`. They default to `listening` and `música`.
 
 Restart the bot after changing any of these.
+
+### Playback behavior
+
+- YouTube, YouTube Music, `youtu.be`, and Shorts links are accepted.
+- Shared `t=` or `start=` timestamps begin playback at that position.
+- A watch URL containing `list=` plays the selected video; an explicit `/playlist` URL queues the playlist.
+- Playlist requests show loading feedback and can be canceled before they are committed to the queue.
+- The final response reports unavailable playlist entries and tracks omitted by the queue limit.
+- The latest `/play` or `/queue` response becomes the single live player panel and updates as playback changes.
+- If a stream fails, the bot refreshes it once. If recovery also fails, the unavailable track is skipped and the channel is notified.
 
 ## YouTube PO tokens
 

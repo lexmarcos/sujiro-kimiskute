@@ -314,6 +314,7 @@ impl GuildPlayerState {
             track,
             playback_id: operation.playback_id,
             session_epoch: operation.session_epoch,
+            recovery_attempted: false,
             handle: None,
         });
         self.playback_state = PlaybackState::Starting;

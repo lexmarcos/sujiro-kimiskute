@@ -1,8 +1,8 @@
 use super::GuildPlayer;
 use crate::error::AppError;
 use crate::player::playback_state::{
-    PlaybackOperation, PlaybackSkipClaim, PlaybackState, PreviousPlayback, PreviousPlaybackClaim,
-    SkippedPlayback, StoppedPlayback,
+    ClaimedPlayback, PlaybackOperation, PlaybackRecoveryClaim, PlaybackSkipClaim, PlaybackState,
+    PreviousPlayback, PreviousPlaybackClaim, SkippedPlayback, StoppedPlayback,
 };
 
 impl GuildPlayer {
@@ -53,14 +53,46 @@ impl GuildPlayer {
         state.playback_state = PlaybackState::Idle;
         let operation = state.begin_playback(previous_track.clone());
 
-        Ok(PreviousPlaybackClaim::Ready(PreviousPlayback {
+        Ok(PreviousPlaybackClaim::Ready(Box::new(PreviousPlayback {
             track: previous_track,
             operation,
             interrupted_track_id: interrupted
                 .as_ref()
                 .map(|current| current.track.track.id.clone()),
             interrupted_handle: interrupted.and_then(|current| current.handle),
-        }))
+        })))
+    }
+
+    pub(crate) async fn claim_playback_recovery(
+        &self,
+        operation: PlaybackOperation,
+    ) -> PlaybackRecoveryClaim {
+        let mut state = self.inner.lock().await;
+        if state.ensure_active(self.guild_id).is_err() || !state.current_matches(operation) {
+            return PlaybackRecoveryClaim::Stale;
+        }
+        let Some(current) = state.current.take() else {
+            return PlaybackRecoveryClaim::Stale;
+        };
+
+        state.playback_state = PlaybackState::Idle;
+        if current.recovery_attempted {
+            let claimed_advancer = state.claim_queue_advancer();
+            return PlaybackRecoveryClaim::Skip {
+                track: current.track,
+                claimed_advancer,
+            };
+        }
+
+        let track = current.track;
+        let retry_operation = state.begin_playback(track.clone());
+        if let Some(retry) = state.current.as_mut() {
+            retry.recovery_attempted = true;
+        }
+        PlaybackRecoveryClaim::Retry(ClaimedPlayback {
+            operation: retry_operation,
+            track,
+        })
     }
 
     pub(crate) async fn claim_stop(&self) -> Result<StoppedPlayback, AppError> {

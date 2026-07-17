@@ -164,6 +164,33 @@ impl PlayerObserver for PlayerPanelService {
     async fn player_changed(&self, guild_id: GuildId) {
         self.refresh(guild_id).await;
     }
+
+    async fn track_failed(&self, guild_id: GuildId, track: &QueuedTrack) {
+        let Some(http) = self.http.get() else {
+            return;
+        };
+        let Some(channel_id) = self.channel_id(guild_id).await else {
+            return;
+        };
+        let title = truncate_text(&track.track.title, MAX_QUEUE_TITLE_CHARS);
+        let message = match self.language {
+            BotLanguage::PtBr => {
+                format!("⚠️ Não consegui tocar **{title}** e avancei para a próxima música.")
+            }
+            BotLanguage::EnUs => {
+                format!("⚠️ I couldn't play **{title}** and moved to the next track.")
+            }
+        };
+        if let Err(source) = channel_id.say(http, message).await {
+            warn!(
+                guild_id = %guild_id,
+                channel_id = %channel_id,
+                track_id = %track.track.id,
+                error = %source,
+                "failed to report skipped playback failure"
+            );
+        }
+    }
 }
 
 pub fn now_playing_embed(
@@ -391,9 +418,11 @@ fn upcoming_line(position: usize, track: &QueuedTrack, include_requester: bool) 
         .map(format_duration)
         .map(|value| format!(" · `{value}`"))
         .unwrap_or_default();
-    let requester = include_requester
-        .then(|| format!(" · <@{}>", track.requested_by))
-        .unwrap_or_default();
+    let requester = if include_requester {
+        format!(" · <@{}>", track.requested_by)
+    } else {
+        String::new()
+    };
     format!("`{position}.` {title}{duration}{requester}\n")
 }
 

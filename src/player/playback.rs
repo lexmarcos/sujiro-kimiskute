@@ -17,7 +17,7 @@ use crate::{
         observer::PlayerObserver,
         playback_state::{
             ClaimedPlayback, PlaybackControl, PlaybackControlClaim, PlaybackOperation,
-            PlaybackSkipClaim, PlaybackState,
+            PlaybackRecoveryClaim, PlaybackSkipClaim, PlaybackState,
         },
         queue::QueueInsertionReceipt,
         track::QueuedTrack,
@@ -279,7 +279,7 @@ impl PlaybackService {
         operation: PlaybackOperation,
         resolved_track: &crate::player::track::ResolvedTrack,
     ) -> Result<(), AppError> {
-        let stream_url = match self.resolver.prepare_stream(resolved_track).await {
+        let stream_url = match self.prepare_stream_with_retry(player, resolved_track).await {
             Ok(url) => url,
             Err(error) => {
                 player.clear_playback(operation).await;
@@ -322,6 +322,25 @@ impl PlaybackService {
         );
         self.observer.player_changed(player.guild_id()).await;
         Ok(())
+    }
+
+    async fn prepare_stream_with_retry(
+        &self,
+        player: &GuildPlayer,
+        track: &crate::player::track::ResolvedTrack,
+    ) -> Result<String, AppError> {
+        match self.resolver.prepare_stream(track).await {
+            Ok(url) => Ok(url),
+            Err(first_error) => {
+                warn!(
+                    guild_id = %player.guild_id(),
+                    track_id = %track.id,
+                    error = %first_error,
+                    "stream preparation failed; retrying once"
+                );
+                self.resolver.prepare_stream(track).await
+            }
+        }
     }
 
     async fn install_paused_track(
@@ -371,7 +390,12 @@ impl PlaybackService {
         track.events.add_event(
             EventData::new(
                 Event::Track(TrackEvent::Error),
-                PlaybackErrorHandler::new(player.guild_id(), player.instance_id(), operation),
+                PlaybackErrorHandler::new(
+                    Arc::downgrade(self),
+                    player.guild_id(),
+                    player.instance_id(),
+                    operation,
+                ),
             ),
             Duration::ZERO,
         );
@@ -395,6 +419,81 @@ impl PlaybackService {
 
         stop_created_handle(handle);
         Err(stale_playback_error())
+    }
+
+    pub(crate) async fn track_failed(
+        self: &Arc<Self>,
+        guild_id: serenity::model::id::GuildId,
+        instance_id: u64,
+        operation: PlaybackOperation,
+    ) {
+        let Some(player) = self.players.get(guild_id).await else {
+            return;
+        };
+        if player.instance_id() != instance_id {
+            return;
+        }
+
+        match player.claim_playback_recovery(operation).await {
+            PlaybackRecoveryClaim::Stale => {}
+            PlaybackRecoveryClaim::Retry(claimed) => {
+                warn!(
+                    guild_id = %guild_id,
+                    track_id = %claimed.track.track.id,
+                    failed_playback_id = operation.playback_id,
+                    retry_playback_id = claimed.operation.playback_id,
+                    "retrying failed track playback"
+                );
+                if let Err(error) = self
+                    .start_claimed_track(&player, claimed.operation, &claimed.track.track)
+                    .await
+                {
+                    warn!(
+                        guild_id = %guild_id,
+                        track_id = %claimed.track.track.id,
+                        playback_id = claimed.operation.playback_id,
+                        error = %error,
+                        "failed track recovery could not restart playback"
+                    );
+                    self.finish_failed_recovery(player, claimed.track).await;
+                }
+            }
+            PlaybackRecoveryClaim::Skip {
+                track,
+                claimed_advancer,
+            } => {
+                warn!(
+                    guild_id = %guild_id,
+                    track_id = %track.track.id,
+                    playback_id = operation.playback_id,
+                    "failed track exhausted recovery and was skipped"
+                );
+                self.observer.track_failed(guild_id, &track).await;
+                self.observer.player_changed(guild_id).await;
+                if claimed_advancer {
+                    let playback = Arc::clone(self);
+                    tokio::spawn(async move {
+                        playback.advance_claimed_queue(player).await;
+                    });
+                }
+            }
+        }
+    }
+
+    async fn finish_failed_recovery(
+        self: &Arc<Self>,
+        player: Arc<GuildPlayer>,
+        track: QueuedTrack,
+    ) {
+        let guild_id = player.guild_id();
+        self.observer.track_failed(guild_id, &track).await;
+        self.observer.player_changed(guild_id).await;
+        if player.claim_queue_advancer().await {
+            let playback = Arc::clone(self);
+            tokio::spawn(async move {
+                playback.advance_claimed_queue(player).await;
+            });
+        }
     }
 
     pub(crate) async fn track_ended(

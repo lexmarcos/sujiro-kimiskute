@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use serenity::{
@@ -6,7 +10,11 @@ use serenity::{
     builder::{CreateActionRow, CreateButton, CreateEmbed, EditMessage},
     http::Http,
 };
-use tokio::sync::{Mutex, OnceCell};
+use tokio::{
+    sync::{Mutex, OnceCell},
+    task::AbortHandle,
+    time::MissedTickBehavior,
+};
 use tracing::warn;
 use url::Url;
 
@@ -30,6 +38,8 @@ const MAX_FIELD_VALUE_CHARS: usize = 1_024;
 const MAX_DETAILED_TRACKS: usize = 10;
 const MAX_COMPACT_TRACKS: usize = 3;
 const MAX_QUEUE_TITLE_CHARS: usize = 72;
+const PROGRESS_SEGMENTS: usize = 12;
+const PANEL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 pub enum PanelView {
@@ -37,14 +47,17 @@ pub enum PanelView {
     Detailed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ActivePanel {
     channel_id: ChannelId,
     message_id: MessageId,
     view: PanelView,
+    generation: u64,
+    refresh_abort: Option<AbortHandle>,
 }
 
 pub struct PlayerPanelService {
+    weak_self: Weak<PlayerPanelService>,
     http: OnceCell<Arc<Http>>,
     players: Arc<PlayerManager>,
     language: BotLanguage,
@@ -53,7 +66,8 @@ pub struct PlayerPanelService {
 
 impl PlayerPanelService {
     pub fn new(players: Arc<PlayerManager>, language: BotLanguage) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|weak_self| Self {
+            weak_self: weak_self.clone(),
             http: OnceCell::new(),
             players,
             language,
@@ -66,24 +80,33 @@ impl PlayerPanelService {
     }
 
     pub async fn register(
-        &self,
+        self: &Arc<Self>,
         guild_id: GuildId,
         channel_id: ChannelId,
         message_id: MessageId,
         view: PanelView,
     ) {
-        let previous = self.panels.lock().await.insert(
-            guild_id,
-            ActivePanel {
-                channel_id,
-                message_id,
-                view,
-            },
-        );
-        if let Some(previous) = previous
-            && (previous.channel_id != channel_id || previous.message_id != message_id)
-        {
-            self.disable(previous).await;
+        let previous = {
+            let mut panels = self.panels.lock().await;
+            let generation = panels
+                .get(&guild_id)
+                .map_or(1, |panel| panel.generation.wrapping_add(1));
+            panels.insert(
+                guild_id,
+                ActivePanel {
+                    channel_id,
+                    message_id,
+                    view,
+                    generation,
+                    refresh_abort: None,
+                },
+            )
+        };
+        if let Some(mut previous) = previous {
+            abort_refresh(previous.refresh_abort.take());
+            if previous.channel_id != channel_id || previous.message_id != message_id {
+                self.disable(&previous).await;
+            }
         }
         self.refresh(guild_id).await;
     }
@@ -97,15 +120,16 @@ impl PlayerPanelService {
     }
 
     pub async fn refresh(&self, guild_id: GuildId) {
+        self.abort_guild_refresh(guild_id).await;
         let Some(http) = self.http.get() else {
             return;
         };
-        let Some(panel) = self.panels.lock().await.get(&guild_id).copied() else {
+        let Some(panel) = self.panel(guild_id).await else {
             return;
         };
         let Some(player) = self.players.get(guild_id).await else {
-            self.disable(panel).await;
-            self.panels.lock().await.remove(&guild_id);
+            self.disable(&panel).await;
+            self.remove_if_same(guild_id, panel).await;
             return;
         };
         let snapshot = player.snapshot().await;
@@ -123,10 +147,93 @@ impl PlayerPanelService {
                 "failed to refresh active player panel"
             );
             self.remove_if_same(guild_id, panel).await;
+            return;
+        }
+        if snapshot.playback_state == PlaybackState::Playing && snapshot.current.is_some() {
+            self.start_refresh_task(guild_id, panel.generation).await;
         }
     }
 
-    async fn disable(&self, panel: ActivePanel) {
+    async fn panel(&self, guild_id: GuildId) -> Option<ActivePanel> {
+        self.panels
+            .lock()
+            .await
+            .get(&guild_id)
+            .map(|panel| ActivePanel {
+                channel_id: panel.channel_id,
+                message_id: panel.message_id,
+                view: panel.view,
+                generation: panel.generation,
+                refresh_abort: None,
+            })
+    }
+
+    async fn abort_guild_refresh(&self, guild_id: GuildId) {
+        let abort_handle = self
+            .panels
+            .lock()
+            .await
+            .get_mut(&guild_id)
+            .and_then(|panel| panel.refresh_abort.take());
+        abort_refresh(abort_handle);
+    }
+
+    async fn start_refresh_task(&self, guild_id: GuildId, generation: u64) {
+        let weak_service = self.weak_self.clone();
+        let task = tokio::spawn(async move {
+            run_refresh_loop(weak_service, guild_id, generation).await;
+        });
+        let abort_handle = task.abort_handle();
+        let mut panels = self.panels.lock().await;
+        let Some(panel) = panels.get_mut(&guild_id) else {
+            abort_handle.abort();
+            return;
+        };
+        if panel.generation != generation {
+            abort_handle.abort();
+            return;
+        }
+        panel.refresh_abort = Some(abort_handle);
+    }
+
+    async fn refresh_generation(&self, guild_id: GuildId, generation: u64) -> RefreshLoopControl {
+        let Some(http) = self.http.get() else {
+            return RefreshLoopControl::Stop;
+        };
+        let Some(panel) = self.panel(guild_id).await else {
+            return RefreshLoopControl::Stop;
+        };
+        if panel.generation != generation {
+            return RefreshLoopControl::Stop;
+        }
+        let Some(player) = self.players.get(guild_id).await else {
+            self.remove_if_same(guild_id, panel).await;
+            return RefreshLoopControl::Stop;
+        };
+        let snapshot = player.snapshot().await;
+        if snapshot.playback_state != PlaybackState::Playing || snapshot.current.is_none() {
+            return RefreshLoopControl::Stop;
+        }
+        let builder = panel_message(&snapshot, panel.view, self.language);
+        if let Err(source) = panel
+            .channel_id
+            .edit_message(http, panel.message_id, builder)
+            .await
+        {
+            warn!(
+                guild_id = %guild_id,
+                channel_id = %panel.channel_id,
+                message_id = %panel.message_id,
+                error = %source,
+                "failed to refresh player progress"
+            );
+            self.remove_if_same(guild_id, panel).await;
+            return RefreshLoopControl::Stop;
+        }
+        RefreshLoopControl::Continue
+    }
+
+    async fn disable(&self, panel: &ActivePanel) {
         let Some(http) = self.http.get() else {
             return;
         };
@@ -149,13 +256,47 @@ impl PlayerPanelService {
     }
 
     async fn remove_if_same(&self, guild_id: GuildId, panel: ActivePanel) {
-        let mut panels = self.panels.lock().await;
-        let matches = panels.get(&guild_id).is_some_and(|current| {
-            current.channel_id == panel.channel_id && current.message_id == panel.message_id
-        });
-        if matches {
-            panels.remove(&guild_id);
+        let removed = {
+            let mut panels = self.panels.lock().await;
+            let matches = panels.get(&guild_id).is_some_and(|current| {
+                current.channel_id == panel.channel_id
+                    && current.message_id == panel.message_id
+                    && current.generation == panel.generation
+            });
+            matches.then(|| panels.remove(&guild_id)).flatten()
+        };
+        if let Some(removed) = removed {
+            abort_refresh(removed.refresh_abort);
         }
+    }
+}
+
+enum RefreshLoopControl {
+    Continue,
+    Stop,
+}
+
+async fn run_refresh_loop(service: Weak<PlayerPanelService>, guild_id: GuildId, generation: u64) {
+    let mut interval = tokio::time::interval(PANEL_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        if matches!(
+            service.refresh_generation(guild_id, generation).await,
+            RefreshLoopControl::Stop
+        ) {
+            return;
+        }
+    }
+}
+
+fn abort_refresh(abort_handle: Option<AbortHandle>) {
+    if let Some(abort_handle) = abort_handle {
+        abort_handle.abort();
     }
 }
 
@@ -305,6 +446,9 @@ fn now_playing_embed_for_view(
     if let Some(thumbnail_url) = valid_thumbnail_url(track.thumbnail_url.as_deref()) {
         embed = embed.thumbnail(thumbnail_url);
     }
+    if let Some(progress) = progress_label(snapshot, language) {
+        embed = embed.field(progress_field_name(language), progress, false);
+    }
     let (limit, include_requester) = match view {
         PanelView::Compact => (MAX_COMPACT_TRACKS, false),
         PanelView::Detailed => (MAX_DETAILED_TRACKS, true),
@@ -426,6 +570,51 @@ fn upcoming_line(position: usize, track: &QueuedTrack, include_requester: bool) 
     format!("`{position}.` {title}{duration}{requester}\n")
 }
 
+fn progress_label(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> Option<String> {
+    let current = snapshot.current.as_ref()?;
+    let position = snapshot.position_seconds?;
+    let Some(duration) = current.track.duration_seconds else {
+        return Some(match language {
+            BotLanguage::PtBr => format!("Decorrido: `{}`", format_duration(position)),
+            BotLanguage::EnUs => format!("Elapsed: `{}`", format_duration(position)),
+        });
+    };
+    let position = position.min(duration);
+    let progress_bar = progress_bar(position, duration);
+    let timing = format!(
+        "{progress_bar} `{}` / `{}`",
+        format_duration(position),
+        format_duration(duration)
+    );
+    if snapshot.playback_state != PlaybackState::Playing || position >= duration {
+        return Some(timing);
+    }
+    let end_timestamp = unix_timestamp_after(duration - position)?;
+    let end_label = match language {
+        BotLanguage::PtBr => "Termina",
+        BotLanguage::EnUs => "Ends",
+    };
+    Some(format!("{timing}\n{end_label} <t:{end_timestamp}:R>"))
+}
+
+fn progress_bar(position: u64, duration: u64) -> String {
+    if duration == 0 {
+        return format!("●{}", "─".repeat(PROGRESS_SEGMENTS));
+    }
+    let marker = ((position as u128 * PROGRESS_SEGMENTS as u128) / duration as u128)
+        .min(PROGRESS_SEGMENTS as u128) as usize;
+    let mut bar = String::with_capacity(PROGRESS_SEGMENTS * 3);
+    for index in 0..=PROGRESS_SEGMENTS {
+        bar.push(if index == marker { '●' } else { '─' });
+    }
+    bar
+}
+
+fn unix_timestamp_after(seconds: u64) -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    now.checked_add(seconds)
+}
+
 fn valid_thumbnail_url(value: Option<&str>) -> Option<&str> {
     let value = value?;
     let parsed = Url::parse(value).ok()?;
@@ -475,6 +664,13 @@ fn state_field_name(language: BotLanguage) -> &'static str {
     match language {
         BotLanguage::PtBr => "Estado",
         BotLanguage::EnUs => "Status",
+    }
+}
+
+fn progress_field_name(language: BotLanguage) -> &'static str {
+    match language {
+        BotLanguage::PtBr => "Progresso",
+        BotLanguage::EnUs => "Progress",
     }
 }
 

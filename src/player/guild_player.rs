@@ -30,6 +30,7 @@ pub struct GuildPlayerSnapshot {
     pub current: Option<QueuedTrack>,
     pub queued: Vec<QueuedTrack>,
     pub playback_state: PlaybackState,
+    pub position_seconds: Option<u64>,
     pub has_previous: bool,
     pub session_epoch: u64,
     pub playback_id: u64,
@@ -114,16 +115,30 @@ impl GuildPlayer {
     }
 
     pub async fn snapshot(&self) -> GuildPlayerSnapshot {
-        let state = self.inner.lock().await;
-        GuildPlayerSnapshot {
-            voice_channel_id: state.voice_channel_id,
-            current: state.current.as_ref().map(|current| current.track.clone()),
-            queued: state.queue.iter().cloned().collect(),
-            playback_state: state.playback_state,
-            has_previous: !state.history.is_empty(),
-            session_epoch: state.session_epoch,
-            playback_id: state.playback_id,
+        let (mut snapshot, handle) = {
+            let state = self.inner.lock().await;
+            let snapshot = GuildPlayerSnapshot {
+                voice_channel_id: state.voice_channel_id,
+                current: state.current.as_ref().map(|current| current.track.clone()),
+                queued: state.queue.iter().cloned().collect(),
+                playback_state: state.playback_state,
+                position_seconds: None,
+                has_previous: !state.history.is_empty(),
+                session_epoch: state.session_epoch,
+                playback_id: state.playback_id,
+            };
+            let handle = state
+                .current
+                .as_ref()
+                .and_then(|current| current.handle.clone());
+            (snapshot, handle)
+        };
+        if let Some(handle) = handle
+            && let Ok(track_state) = handle.get_info().await
+        {
+            snapshot.position_seconds = Some(track_state.position.as_secs());
         }
+        snapshot
     }
 
     pub async fn advance_session_epoch(&self) -> u64 {

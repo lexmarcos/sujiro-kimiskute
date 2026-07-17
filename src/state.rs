@@ -54,7 +54,11 @@ impl AppState {
             Arc::clone(&songbird),
             Arc::clone(&players),
         ));
-        let player_panels = PlayerPanelService::new(Arc::clone(&players), config.bot_language);
+        let player_panels = PlayerPanelService::new(
+            Arc::clone(&players),
+            config.bot_language,
+            config.player_panel_update_interval,
+        );
         let player_observer: Arc<dyn PlayerObserver> = player_panels.clone();
         let playback = PlaybackService::new(
             Arc::clone(&track_resolver),

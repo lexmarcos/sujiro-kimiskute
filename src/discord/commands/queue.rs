@@ -32,7 +32,14 @@ pub async fn run(
     let Some(snapshot) = queue_snapshot(state, guild_id).await else {
         return respond(context, command, empty_queue_message(language), false).await;
     };
-    let message = respond_with_snapshot(context, command, &snapshot, language).await?;
+    let message = respond_with_snapshot(
+        context,
+        command,
+        &snapshot,
+        language,
+        state.config.player_panel_update_interval.is_some(),
+    )
+    .await?;
     state
         .player_panels
         .register(
@@ -59,8 +66,9 @@ async fn respond_with_snapshot(
     command: &CommandInteraction,
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
+    progress_enabled: bool,
 ) -> Result<serenity::all::Message, serenity::Error> {
-    let message = match now_playing_embed(snapshot, language) {
+    let message = match now_playing_embed(snapshot, language, progress_enabled) {
         Some(embed) => CreateInteractionResponseMessage::new()
             .content(now_playing_message(language))
             .embed(embed)

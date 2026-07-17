@@ -39,7 +39,6 @@ const MAX_DETAILED_TRACKS: usize = 10;
 const MAX_COMPACT_TRACKS: usize = 3;
 const MAX_QUEUE_TITLE_CHARS: usize = 72;
 const PROGRESS_SEGMENTS: usize = 12;
-const PANEL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 pub enum PanelView {
@@ -61,16 +60,22 @@ pub struct PlayerPanelService {
     http: OnceCell<Arc<Http>>,
     players: Arc<PlayerManager>,
     language: BotLanguage,
+    update_interval: Option<Duration>,
     panels: Mutex<HashMap<GuildId, ActivePanel>>,
 }
 
 impl PlayerPanelService {
-    pub fn new(players: Arc<PlayerManager>, language: BotLanguage) -> Arc<Self> {
+    pub fn new(
+        players: Arc<PlayerManager>,
+        language: BotLanguage,
+        update_interval: Option<Duration>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| Self {
             weak_self: weak_self.clone(),
             http: OnceCell::new(),
             players,
             language,
+            update_interval,
             panels: Mutex::new(HashMap::new()),
         })
     }
@@ -133,7 +138,12 @@ impl PlayerPanelService {
             return;
         };
         let snapshot = player.snapshot().await;
-        let builder = panel_message(&snapshot, panel.view, self.language);
+        let builder = panel_message(
+            &snapshot,
+            panel.view,
+            self.language,
+            self.update_interval.is_some(),
+        );
         if let Err(source) = panel
             .channel_id
             .edit_message(http, panel.message_id, builder)
@@ -149,7 +159,10 @@ impl PlayerPanelService {
             self.remove_if_same(guild_id, panel).await;
             return;
         }
-        if snapshot.playback_state == PlaybackState::Playing && snapshot.current.is_some() {
+        if snapshot.playback_state == PlaybackState::Playing
+            && snapshot.current.is_some()
+            && self.update_interval.is_some()
+        {
             self.start_refresh_task(guild_id, panel.generation).await;
         }
     }
@@ -179,9 +192,12 @@ impl PlayerPanelService {
     }
 
     async fn start_refresh_task(&self, guild_id: GuildId, generation: u64) {
+        let Some(update_interval) = self.update_interval else {
+            return;
+        };
         let weak_service = self.weak_self.clone();
         let task = tokio::spawn(async move {
-            run_refresh_loop(weak_service, guild_id, generation).await;
+            run_refresh_loop(weak_service, guild_id, generation, update_interval).await;
         });
         let abort_handle = task.abort_handle();
         let mut panels = self.panels.lock().await;
@@ -214,7 +230,12 @@ impl PlayerPanelService {
         if snapshot.playback_state != PlaybackState::Playing || snapshot.current.is_none() {
             return RefreshLoopControl::Stop;
         }
-        let builder = panel_message(&snapshot, panel.view, self.language);
+        let builder = panel_message(
+            &snapshot,
+            panel.view,
+            self.language,
+            self.update_interval.is_some(),
+        );
         if let Err(source) = panel
             .channel_id
             .edit_message(http, panel.message_id, builder)
@@ -276,8 +297,13 @@ enum RefreshLoopControl {
     Stop,
 }
 
-async fn run_refresh_loop(service: Weak<PlayerPanelService>, guild_id: GuildId, generation: u64) {
-    let mut interval = tokio::time::interval(PANEL_REFRESH_INTERVAL);
+async fn run_refresh_loop(
+    service: Weak<PlayerPanelService>,
+    guild_id: GuildId,
+    generation: u64,
+    update_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(update_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     interval.tick().await;
     loop {
@@ -337,8 +363,9 @@ impl PlayerObserver for PlayerPanelService {
 pub fn now_playing_embed(
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
+    progress_enabled: bool,
 ) -> Option<CreateEmbed> {
-    now_playing_embed_for_view(snapshot, PanelView::Detailed, language)
+    now_playing_embed_for_view(snapshot, PanelView::Detailed, language, progress_enabled)
 }
 
 pub fn control_row(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> CreateActionRow {
@@ -396,8 +423,9 @@ fn panel_message(
     snapshot: &GuildPlayerSnapshot,
     view: PanelView,
     language: BotLanguage,
+    progress_enabled: bool,
 ) -> EditMessage {
-    match now_playing_embed_for_view(snapshot, view, language) {
+    match now_playing_embed_for_view(snapshot, view, language, progress_enabled) {
         Some(embed) => EditMessage::new()
             .content(now_playing_message(language))
             .embed(embed)
@@ -413,6 +441,7 @@ fn now_playing_embed_for_view(
     snapshot: &GuildPlayerSnapshot,
     view: PanelView,
     language: BotLanguage,
+    progress_enabled: bool,
 ) -> Option<CreateEmbed> {
     let current = snapshot.current.as_ref()?;
     let track = &current.track;
@@ -446,7 +475,7 @@ fn now_playing_embed_for_view(
     if let Some(thumbnail_url) = valid_thumbnail_url(track.thumbnail_url.as_deref()) {
         embed = embed.thumbnail(thumbnail_url);
     }
-    if let Some(progress) = progress_label(snapshot, language) {
+    if progress_enabled && let Some(progress) = progress_label(snapshot, language) {
         embed = embed.field(progress_field_name(language), progress, false);
     }
     let (limit, include_requester) = match view {

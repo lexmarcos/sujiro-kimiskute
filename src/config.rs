@@ -10,6 +10,7 @@ const DEFAULT_BOT_ACTIVITY_TYPE: &str = "listening";
 const DEFAULT_BOT_LANGUAGE: &str = "pt-BR";
 const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "4";
 const DEFAULT_MAX_QUEUE_SIZE: &str = "50";
+const DEFAULT_PLAYER_PANEL_UPDATE_SECONDS: &str = "5";
 const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_YT_DLP_PATH: &str = "yt-dlp";
 const DEFAULT_YT_DLP_TIMEOUT_SECONDS: &str = "20";
@@ -23,6 +24,7 @@ pub struct AppConfig {
     pub yt_dlp_extra_args: Vec<String>,
     pub yt_dlp_timeout: Duration,
     pub auto_leave_timeout: Duration,
+    pub player_panel_update_interval: Option<Duration>,
     pub max_queue_size: usize,
     pub max_concurrent_resolutions: usize,
     pub rust_log: String,
@@ -53,6 +55,10 @@ impl AppConfig {
             configured_duration("YT_DLP_TIMEOUT_SECONDS", DEFAULT_YT_DLP_TIMEOUT_SECONDS)?;
         let auto_leave_timeout =
             configured_duration("AUTO_LEAVE_SECONDS", DEFAULT_AUTO_LEAVE_SECONDS)?;
+        let player_panel_update_interval = configured_optional_duration(
+            "PLAYER_PANEL_UPDATE_SECONDS",
+            DEFAULT_PLAYER_PANEL_UPDATE_SECONDS,
+        )?;
         let max_queue_size = configured_usize("MAX_QUEUE_SIZE", DEFAULT_MAX_QUEUE_SIZE)?;
         let max_concurrent_resolutions = configured_usize(
             "MAX_CONCURRENT_RESOLUTIONS",
@@ -69,6 +75,7 @@ impl AppConfig {
             yt_dlp_extra_args,
             yt_dlp_timeout,
             auto_leave_timeout,
+            player_panel_update_interval,
             max_queue_size,
             max_concurrent_resolutions,
             rust_log,
@@ -196,6 +203,22 @@ fn non_empty_value(name: &'static str, value: String) -> Result<String, ConfigEr
 fn configured_duration(name: &'static str, default: &str) -> Result<Duration, ConfigError> {
     let seconds = positive_u64(name, optional_value(name, default)?)?;
     Ok(Duration::from_secs(seconds))
+}
+
+fn configured_optional_duration(
+    name: &'static str,
+    default: &str,
+) -> Result<Option<Duration>, ConfigError> {
+    let value = optional_value(name, default)?;
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|source| ConfigError::InvalidInteger {
+            name,
+            value: value.clone(),
+            source,
+        })?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn configured_usize(name: &'static str, default: &str) -> Result<usize, ConfigError> {

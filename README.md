@@ -87,6 +87,7 @@ Two settings are worth knowing:
 
 - `BOT_LANGUAGE` sets the language for command descriptions, responses, embeds, and controls. Supported values are `pt-BR` and `en-US`, defaulting to `pt-BR` when omitted. Slash command names stay in English either way.
 - `BOT_ACTIVITY_TYPE` and `BOT_ACTIVITY_MESSAGE` set the presence shown on the bot. The type is case-sensitive and accepts `playing`, `watching`, `listening`, or `competing`. They default to `listening` and `música`.
+- `PLAYER_PANEL_UPDATE_SECONDS` controls live playback-progress updates. It defaults to `5`; positive values set the interval in seconds. Set it to `0` to disable the progress display and periodic panel edits while keeping immediate updates for pause, skip, stop, and track changes.
 
 Restart the bot after changing any of these.
 

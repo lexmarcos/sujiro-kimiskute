@@ -99,7 +99,15 @@ pub async fn run(
     match commit {
         Ok(receipt) => {
             let snapshot = player.snapshot().await;
-            let message = edit_success(context, command, receipt, &snapshot, language).await?;
+            let message = edit_success(
+                context,
+                command,
+                receipt,
+                &snapshot,
+                language,
+                state.config.player_panel_update_interval.is_some(),
+            )
+            .await?;
             state
                 .player_panels
                 .register(guild_id, message.channel_id, message.id, PanelView::Compact)
@@ -368,8 +376,9 @@ async fn edit_success(
     receipt: PlayCommitReceipt,
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
+    progress_enabled: bool,
 ) -> Result<serenity::all::Message, serenity::Error> {
-    let response = match now_playing_embed(snapshot, language) {
+    let response = match now_playing_embed(snapshot, language, progress_enabled) {
         Some(embed) => EditInteractionResponse::new()
             .content(success_message(&receipt, language))
             .embed(embed)

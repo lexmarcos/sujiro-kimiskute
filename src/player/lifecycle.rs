@@ -21,6 +21,7 @@ pub(crate) struct LeaveOperation {
     pub removed_from_queue: usize,
     pub session_epoch: u64,
     pub auto_leave_abort: Option<AbortHandle>,
+    pub idle_leave_abort: Option<AbortHandle>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -32,6 +33,21 @@ pub(crate) struct AutoLeaveToken {
 pub(super) struct AutoLeaveTimer {
     pub token: AutoLeaveToken,
     pub abort_handle: Option<AbortHandle>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct IdleLeaveToken {
+    pub generation: u64,
+}
+
+pub(super) struct IdleLeaveTimer {
+    pub token: IdleLeaveToken,
+    pub abort_handle: Option<AbortHandle>,
+}
+
+pub(crate) struct IdleLeaveCancellation {
+    pub abort_handle: Option<AbortHandle>,
+    pub canceled: bool,
 }
 
 pub(crate) struct AutoLeaveCancellation {

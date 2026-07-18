@@ -42,6 +42,11 @@ pub enum PlayRequestCancellation {
     NotFound,
 }
 
+pub(crate) enum PlayRequestAbandonment {
+    Abandoned { should_drain: bool },
+    NotFound,
+}
+
 pub struct PlayRequestSequencer {
     inner: Mutex<SequencerState>,
     changed: Notify,
@@ -65,6 +70,11 @@ struct ReservedPlayRequest {
     requested_by: UserId,
     abort_handle: Option<AbortHandle>,
     response: oneshot::Sender<Result<PlayCommitReceipt, AppError>>,
+}
+
+struct RemovedPlayRequest {
+    canceled: CanceledPlayRequest,
+    should_drain: bool,
 }
 
 struct CanceledPlayRequest {
@@ -174,30 +184,49 @@ impl PlayRequestSequencer {
         reservation: PlayRequestReservation,
         requested_by: UserId,
     ) -> PlayRequestCancellation {
-        let (canceled, should_drain) = {
-            let mut state = self.inner.lock().await;
-            let Some(slot) = state.slots.get(&reservation.sequence) else {
-                return PlayRequestCancellation::NotFound;
-            };
-            if slot.session_epoch() != reservation.session_epoch {
-                return PlayRequestCancellation::NotFound;
-            }
-            if slot.requested_by() != requested_by {
-                return PlayRequestCancellation::Forbidden;
-            }
-
-            let Some(slot) = state.slots.remove(&reservation.sequence) else {
-                return PlayRequestCancellation::NotFound;
-            };
-            state.advance_over_gaps();
-            let should_drain = state.start_draining_if_ready();
-            (slot.into_canceled(), should_drain)
+        let mut state = self.inner.lock().await;
+        let Some(slot) = state.matching_slot(reservation) else {
+            return PlayRequestCancellation::NotFound;
         };
-        self.changed.notify_waiters();
-        canceled.finish(AppError::Canceled {
-            operation: "play request",
-        });
+        if slot.requested_by() != requested_by {
+            return PlayRequestCancellation::Forbidden;
+        }
+        let Some(removed) = state.remove_request(reservation) else {
+            return PlayRequestCancellation::NotFound;
+        };
+        drop(state);
+
+        let RemovedPlayRequest {
+            canceled,
+            should_drain,
+        } = removed;
+        self.finish_removal(canceled, canceled_request_error());
         PlayRequestCancellation::Canceled { should_drain }
+    }
+
+    pub(crate) async fn abandon(
+        &self,
+        reservation: PlayRequestReservation,
+    ) -> PlayRequestAbandonment {
+        let removed = {
+            let mut state = self.inner.lock().await;
+            state.remove_request(reservation)
+        };
+        let Some(removed) = removed else {
+            return PlayRequestAbandonment::NotFound;
+        };
+
+        let RemovedPlayRequest {
+            canceled,
+            should_drain,
+        } = removed;
+        self.finish_removal(canceled, abandoned_request_error(reservation));
+        PlayRequestAbandonment::Abandoned { should_drain }
+    }
+
+    pub async fn has_outstanding_work(&self) -> bool {
+        let state = self.inner.lock().await;
+        state.draining || !state.slots.is_empty()
     }
 
     pub async fn take_next(&self) -> Option<PendingPlayRequest> {
@@ -205,6 +234,7 @@ impl PlayRequestSequencer {
         let next_commit = state.next_commit;
         let Some(PlayRequestSlot::Ready(request)) = state.slots.remove(&next_commit) else {
             state.draining = false;
+            self.changed.notify_waiters();
             return None;
         };
         state.next_commit = state.next_commit.wrapping_add(1);
@@ -239,6 +269,11 @@ impl PlayRequestSequencer {
         canceled_count
     }
 
+    fn finish_removal(&self, canceled: CanceledPlayRequest, error: AppError) {
+        self.changed.notify_waiters();
+        canceled.finish(error);
+    }
+
     async fn wait_for_drain_role(&self, sequence: u64) -> bool {
         loop {
             let notification = self.changed.notified();
@@ -265,6 +300,25 @@ impl Default for PlayRequestSequencer {
 }
 
 impl SequencerState {
+    fn matching_slot(&self, reservation: PlayRequestReservation) -> Option<&PlayRequestSlot> {
+        self.slots
+            .get(&reservation.sequence)
+            .filter(|slot| slot.session_epoch() == reservation.session_epoch)
+    }
+
+    fn remove_request(
+        &mut self,
+        reservation: PlayRequestReservation,
+    ) -> Option<RemovedPlayRequest> {
+        self.matching_slot(reservation)?;
+        let slot = self.slots.remove(&reservation.sequence)?;
+        self.advance_over_gaps();
+        Some(RemovedPlayRequest {
+            canceled: slot.into_canceled(),
+            should_drain: self.start_draining_if_ready(),
+        })
+    }
+
     fn advance_over_gaps(&mut self) {
         while self.next_commit < self.next_reservation
             && !self.slots.contains_key(&self.next_commit)
@@ -322,6 +376,21 @@ impl CanceledPlayRequest {
             abort_handle.abort();
         }
         let _ = self.response.send(Err(error));
+    }
+}
+
+fn canceled_request_error() -> AppError {
+    AppError::Canceled {
+        operation: "play request",
+    }
+}
+
+fn abandoned_request_error(reservation: PlayRequestReservation) -> AppError {
+    AppError::Internal {
+        context: format!(
+            "play request sequence {} for session {} was abandoned before commit",
+            reservation.sequence, reservation.session_epoch
+        ),
     }
 }
 

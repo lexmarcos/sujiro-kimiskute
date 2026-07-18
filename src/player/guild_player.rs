@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::{
     error::AppError,
     player::{
-        lifecycle::{AutoLeaveTimer, PlayerLifecycle},
+        lifecycle::{AutoLeaveTimer, IdleLeaveTimer, PlayerLifecycle},
         play_requests::PlayRequestSequencer,
         playback_state::{CurrentTrack, PlaybackOperation, PlaybackState},
         queue::TrackQueue,
@@ -60,6 +60,8 @@ struct GuildPlayerState {
     lifecycle: PlayerLifecycle,
     auto_leave_generation: u64,
     auto_leave_timer: Option<AutoLeaveTimer>,
+    idle_leave_generation: u64,
+    idle_leave_timer: Option<IdleLeaveTimer>,
 }
 
 impl GuildPlayer {
@@ -85,6 +87,8 @@ impl GuildPlayer {
                 lifecycle: PlayerLifecycle::Active,
                 auto_leave_generation: 0,
                 auto_leave_timer: None,
+                idle_leave_generation: 0,
+                idle_leave_timer: None,
             }),
             voice_change: Notify::new(),
             play_requests: PlayRequestSequencer::new(),

@@ -241,6 +241,7 @@ impl PlaybackService {
     ) {
         loop {
             let Some(claimed) = next.take() else {
+                self.observer.player_changed(player.guild_id()).await;
                 return;
             };
             let track_id = claimed.track.track.id.clone();

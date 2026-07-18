@@ -12,7 +12,7 @@ use crate::{
     state::AppState,
 };
 
-use super::commands::play::drain_ready_requests;
+use super::commands::play::{refresh_if_quiescent, spawn_drainer};
 
 pub const CANCEL_PLAY_PREFIX: &str = "sujiro:play:cancel:";
 
@@ -81,14 +81,12 @@ async fn cancel_request(
         .await
     {
         PlayRequestCancellation::Canceled { should_drain } => {
-            disable_cancel_button(context, interaction).await;
             if should_drain {
-                let cache = Arc::clone(&context.cache);
-                let state = Arc::clone(state);
-                tokio::spawn(async move {
-                    drain_ready_requests(cache, state, player).await;
-                });
+                spawn_drainer(context, state, Arc::clone(&player));
+            } else {
+                refresh_if_quiescent(context, state, &player).await;
             }
+            disable_cancel_button(context, interaction).await;
             info!(
                 guild_id = %guild_id,
                 user_id = %interaction.user.id,

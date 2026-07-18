@@ -5,7 +5,8 @@ use super::GuildPlayer;
 use crate::{
     error::AppError,
     player::play_requests::{
-        PendingPlayRequest, PlayRequestCancellation, PlayRequestReservation, PlayRequestTicket,
+        PendingPlayRequest, PlayRequestAbandonment, PlayRequestCancellation,
+        PlayRequestReservation, PlayRequestTicket,
     },
 };
 
@@ -52,6 +53,17 @@ impl GuildPlayer {
         requested_by: UserId,
     ) -> PlayRequestCancellation {
         self.play_requests.cancel(reservation, requested_by).await
+    }
+
+    pub(crate) async fn abandon_play_request(
+        &self,
+        reservation: PlayRequestReservation,
+    ) -> PlayRequestAbandonment {
+        self.play_requests.abandon(reservation).await
+    }
+
+    pub(crate) async fn has_outstanding_play_requests(&self) -> bool {
+        self.play_requests.has_outstanding_work().await
     }
 
     pub async fn take_next_play_request(&self) -> Option<PendingPlayRequest> {

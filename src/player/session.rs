@@ -48,15 +48,22 @@ impl GuildSessionService {
         if let Some(abort_handle) = operation.auto_leave_abort.as_ref() {
             abort_handle.abort();
         }
+        if let Some(abort_handle) = operation.idle_leave_abort.as_ref() {
+            abort_handle.abort();
+        }
         player
             .invalidate_play_requests(operation.session_epoch)
             .await;
         stop_track_handle(&player, &operation);
 
         if let Err(error) = self.voice.disconnect(player.guild_id()).await {
-            player
+            if player
                 .reopen_after_failed_leave(operation.session_epoch)
-                .await;
+                .await
+                && let Some(observer) = self.observer.get()
+            {
+                observer.player_changed(player.guild_id()).await;
+            }
             return Err(error);
         }
         let removed = self

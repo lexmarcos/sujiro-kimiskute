@@ -11,23 +11,27 @@ use serenity::{
 };
 use tracing::error;
 
+mod lifecycle;
 use crate::{
     error::{AppError, VoiceChannelIssue},
     localization::BotLanguage,
     player::{
         guild_player::{GuildPlayer, GuildPlayerSnapshot},
-        play_requests::{PlayCommitReceipt, PlayRequestReservation, PlayRequestTicket},
+        play_requests::{
+            PlayCommitReceipt, PlayRequestAbandonment, PlayRequestReservation, PlayRequestTicket,
+        },
         track::QueuedTrack,
     },
     sources::resolver::{MAX_TRACK_INPUT_CHARS, TrackInputKind, normalize_track_input},
     state::AppState,
     voice::VoiceConnection,
 };
+pub(crate) use lifecycle::{drain_ready_requests, refresh_if_quiescent, spawn_drainer};
 
 use super::{MAX_RESPONSE_CHARS, guild_only_message, respond, respond_app_error, truncate_text};
 use crate::discord::{
     play_requests::CANCEL_PLAY_PREFIX,
-    player_panel::{PanelView, control_row, format_duration, now_playing_embed},
+    player_panel::{PanelView, format_duration, now_playing_embed},
 };
 
 const MAX_TITLE_CHARS: usize = 160;
@@ -82,18 +86,26 @@ pub async fn run(
         Ok(player) => player,
         Err(error) => return edit_error(context, command, error, language).await,
     };
-    if let Err(error) = state.auto_leave.cancel_for_activity(&player).await {
+    if let Err(error) = cancel_leave_timers(state, &player).await {
+        refresh_leave_timers(context, state, guild_id).await;
         return edit_error(context, command, error, language).await;
     }
-    state.idle_leave.cancel_for_activity(guild_id).await;
     let ticket = match player
         .reserve_play_request(channel_id, command.user.id)
         .await
     {
         Ok(ticket) => ticket,
-        Err(error) => return edit_error(context, command, error, language).await,
+        Err(error) => {
+            refresh_leave_timers(context, state, guild_id).await;
+            return edit_error(context, command, error, language).await;
+        }
     };
-    edit_loading(context, command, ticket.reservation, input_kind, language).await?;
+    if let Err(source) =
+        edit_loading(context, command, ticket.reservation, input_kind, language).await
+    {
+        handle_loading_failure(context, state, &player, ticket.reservation).await;
+        return Err(source);
+    }
     spawn_resolution(context, state, &player, ticket.reservation, query).await;
     let commit = wait_for_commit(ticket).await;
 
@@ -122,8 +134,27 @@ pub async fn run(
                 error = %error,
                 "play command failed"
             );
-            state.idle_leave.refresh(guild_id).await;
+            refresh_if_quiescent(context, state, &player).await;
             edit_error(context, command, error, language).await
+        }
+    }
+}
+
+async fn handle_loading_failure(
+    context: &Context,
+    state: &Arc<AppState>,
+    player: &Arc<GuildPlayer>,
+    reservation: PlayRequestReservation,
+) {
+    match player.abandon_play_request(reservation).await {
+        PlayRequestAbandonment::Abandoned { should_drain: true } => {
+            spawn_drainer(context, state, Arc::clone(player));
+        }
+        PlayRequestAbandonment::Abandoned {
+            should_drain: false,
+        }
+        | PlayRequestAbandonment::NotFound => {
+            refresh_if_quiescent(context, state, player).await;
         }
     }
 }
@@ -219,39 +250,26 @@ async fn wait_for_commit(ticket: PlayRequestTicket) -> Result<PlayCommitReceipt,
     })?
 }
 
-pub(crate) async fn drain_ready_requests(
-    cache: Arc<Cache>,
-    state: Arc<AppState>,
-    player: Arc<GuildPlayer>,
-) {
-    while let Some(request) = player.take_next_play_request().await {
-        let sequence = request.reservation.sequence;
-        let response = request.response;
-        let commit = CommitRequest {
-            reservation: request.reservation,
-            channel_id: request.channel_id,
-            requested_by: request.requested_by,
-            resolution: request.resolution,
-        };
-        let result = commit_request(&cache, &state, &player, commit).await;
-        if response.send(result).is_err() {
-            error!(
-                guild_id = %player.guild_id(),
-                sequence,
-                "play request receiver was dropped"
-            );
-        }
-    }
+async fn cancel_leave_timers(state: &AppState, player: &GuildPlayer) -> Result<(), AppError> {
+    state.auto_leave.cancel_for_activity(player).await?;
+    state.idle_leave.cancel_for_activity(player).await
+}
+async fn refresh_leave_timers(context: &Context, state: &AppState, guild_id: GuildId) {
+    state.idle_leave.refresh(guild_id).await;
+    state
+        .auto_leave
+        .refresh(Arc::clone(&context.cache), guild_id)
+        .await;
 }
 
-struct CommitRequest {
-    reservation: PlayRequestReservation,
-    channel_id: ChannelId,
-    requested_by: UserId,
-    resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
+pub(super) struct CommitRequest {
+    pub reservation: PlayRequestReservation,
+    pub channel_id: ChannelId,
+    pub requested_by: UserId,
+    pub resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
 }
 
-async fn commit_request(
+pub(super) async fn commit_request(
     cache: &Cache,
     state: &AppState,
     player: &Arc<GuildPlayer>,
@@ -384,7 +402,7 @@ async fn edit_success(
         Some(embed) => EditInteractionResponse::new()
             .content(success_message(&receipt, language))
             .embed(embed)
-            .components(vec![control_row(snapshot, language)]),
+            .components(Vec::new()),
         None => EditInteractionResponse::new()
             .content(success_message(&receipt, language))
             .components(Vec::new()),

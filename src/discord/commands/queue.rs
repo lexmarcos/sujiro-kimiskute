@@ -9,7 +9,7 @@ use crate::{
 
 use super::{guild_only_message, respond};
 use crate::discord::player_panel::{
-    PanelView, control_row, now_playing_embed, now_playing_message, upcoming_tracks,
+    PanelView, now_playing_embed, now_playing_message, upcoming_tracks,
 };
 
 pub fn definition(language: BotLanguage) -> CreateCommand {
@@ -71,8 +71,7 @@ async fn respond_with_snapshot(
     let message = match now_playing_embed(snapshot, language, progress_enabled) {
         Some(embed) => CreateInteractionResponseMessage::new()
             .content(now_playing_message(language))
-            .embed(embed)
-            .components(vec![control_row(snapshot, language)]),
+            .embed(embed),
         None => CreateInteractionResponseMessage::new()
             .content(waiting_queue_message(snapshot, language)),
     };

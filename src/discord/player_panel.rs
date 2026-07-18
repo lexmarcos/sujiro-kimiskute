@@ -52,6 +52,7 @@ struct ActivePanel {
     message_id: MessageId,
     view: PanelView,
     generation: u64,
+    refresh_revision: u64,
     refresh_abort: Option<AbortHandle>,
 }
 
@@ -103,6 +104,7 @@ impl PlayerPanelService {
                     message_id,
                     view,
                     generation,
+                    refresh_revision: 0,
                     refresh_abort: None,
                 },
             )
@@ -124,12 +126,30 @@ impl PlayerPanelService {
             .map(|panel| panel.channel_id)
     }
 
+    pub async fn interaction_is_active(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        generation: u64,
+    ) -> bool {
+        self.panels
+            .lock()
+            .await
+            .get(&guild_id)
+            .is_some_and(|panel| {
+                panel.channel_id == channel_id
+                    && panel.message_id == message_id
+                    && panel.generation == generation
+            })
+    }
+
     pub async fn refresh(&self, guild_id: GuildId) {
-        self.abort_guild_refresh(guild_id).await;
-        let Some(http) = self.http.get() else {
+        let Some((panel, displaced_refresh)) = self.begin_refresh(guild_id).await else {
             return;
         };
-        let Some(panel) = self.panel(guild_id).await else {
+        abort_refresh(displaced_refresh);
+        let Some(http) = self.http.get() else {
             return;
         };
         let Some(player) = self.players.get(guild_id).await else {
@@ -141,6 +161,7 @@ impl PlayerPanelService {
         let builder = panel_message(
             &snapshot,
             panel.view,
+            panel.generation,
             self.language,
             self.update_interval.is_some(),
         );
@@ -163,35 +184,24 @@ impl PlayerPanelService {
             && snapshot.current.is_some()
             && self.update_interval.is_some()
         {
-            self.start_refresh_task(guild_id, panel.generation).await;
+            self.start_refresh_task(guild_id, panel.generation, panel.refresh_revision)
+                .await;
         }
     }
 
     async fn panel(&self, guild_id: GuildId) -> Option<ActivePanel> {
-        self.panels
-            .lock()
-            .await
-            .get(&guild_id)
-            .map(|panel| ActivePanel {
-                channel_id: panel.channel_id,
-                message_id: panel.message_id,
-                view: panel.view,
-                generation: panel.generation,
-                refresh_abort: None,
-            })
+        self.panels.lock().await.get(&guild_id).map(panel_snapshot)
     }
 
-    async fn abort_guild_refresh(&self, guild_id: GuildId) {
-        let abort_handle = self
-            .panels
-            .lock()
-            .await
-            .get_mut(&guild_id)
-            .and_then(|panel| panel.refresh_abort.take());
-        abort_refresh(abort_handle);
+    async fn begin_refresh(&self, guild_id: GuildId) -> Option<(ActivePanel, Option<AbortHandle>)> {
+        let mut panels = self.panels.lock().await;
+        let panel = panels.get_mut(&guild_id)?;
+        panel.refresh_revision = panel.refresh_revision.wrapping_add(1);
+        let displaced_refresh = panel.refresh_abort.take();
+        Some((panel_snapshot(panel), displaced_refresh))
     }
 
-    async fn start_refresh_task(&self, guild_id: GuildId, generation: u64) {
+    async fn start_refresh_task(&self, guild_id: GuildId, generation: u64, revision: u64) {
         let Some(update_interval) = self.update_interval else {
             return;
         };
@@ -200,16 +210,20 @@ impl PlayerPanelService {
             run_refresh_loop(weak_service, guild_id, generation, update_interval).await;
         });
         let abort_handle = task.abort_handle();
-        let mut panels = self.panels.lock().await;
-        let Some(panel) = panels.get_mut(&guild_id) else {
-            abort_handle.abort();
-            return;
+        drop(task);
+        let displaced = {
+            let mut panels = self.panels.lock().await;
+            let Some(panel) = panels.get_mut(&guild_id) else {
+                abort_handle.abort();
+                return;
+            };
+            if panel.generation != generation || panel.refresh_revision != revision {
+                abort_handle.abort();
+                return;
+            }
+            panel.refresh_abort.replace(abort_handle)
         };
-        if panel.generation != generation {
-            abort_handle.abort();
-            return;
-        }
-        panel.refresh_abort = Some(abort_handle);
+        abort_refresh(displaced);
     }
 
     async fn refresh_generation(&self, guild_id: GuildId, generation: u64) -> RefreshLoopControl {
@@ -233,6 +247,7 @@ impl PlayerPanelService {
         let builder = panel_message(
             &snapshot,
             panel.view,
+            panel.generation,
             self.language,
             self.update_interval.is_some(),
         );
@@ -283,6 +298,7 @@ impl PlayerPanelService {
                 current.channel_id == panel.channel_id
                     && current.message_id == panel.message_id
                     && current.generation == panel.generation
+                    && current.refresh_revision == panel.refresh_revision
             });
             matches.then(|| panels.remove(&guild_id)).flatten()
         };
@@ -317,6 +333,17 @@ async fn run_refresh_loop(
         ) {
             return;
         }
+    }
+}
+
+fn panel_snapshot(panel: &ActivePanel) -> ActivePanel {
+    ActivePanel {
+        channel_id: panel.channel_id,
+        message_id: panel.message_id,
+        view: panel.view,
+        generation: panel.generation,
+        refresh_revision: panel.refresh_revision,
+        refresh_abort: None,
     }
 }
 
@@ -368,15 +395,20 @@ pub fn now_playing_embed(
     now_playing_embed_for_view(snapshot, PanelView::Detailed, language, progress_enabled)
 }
 
-pub fn control_row(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> CreateActionRow {
-    build_control_row(snapshot, language, false)
-}
-
-pub fn disabled_control_row(
+fn control_row(
     snapshot: &GuildPlayerSnapshot,
+    generation: u64,
     language: BotLanguage,
 ) -> CreateActionRow {
-    build_control_row(snapshot, language, true)
+    build_control_row(snapshot, generation, language, false)
+}
+
+fn disabled_control_row(
+    snapshot: &GuildPlayerSnapshot,
+    generation: u64,
+    language: BotLanguage,
+) -> CreateActionRow {
+    build_control_row(snapshot, generation, language, true)
 }
 
 pub fn upcoming_tracks(queued: &[QueuedTrack]) -> Option<String> {
@@ -422,6 +454,7 @@ pub fn now_playing_message(language: BotLanguage) -> &'static str {
 fn panel_message(
     snapshot: &GuildPlayerSnapshot,
     view: PanelView,
+    generation: u64,
     language: BotLanguage,
     progress_enabled: bool,
 ) -> EditMessage {
@@ -429,11 +462,11 @@ fn panel_message(
         Some(embed) => EditMessage::new()
             .content(now_playing_message(language))
             .embed(embed)
-            .components(vec![control_row(snapshot, language)]),
+            .components(vec![control_row(snapshot, generation, language)]),
         None => EditMessage::new()
             .content(idle_panel_message(language))
             .embeds(Vec::new())
-            .components(vec![disabled_control_row(snapshot, language)]),
+            .components(vec![disabled_control_row(snapshot, generation, language)]),
     }
 }
 
@@ -493,6 +526,7 @@ fn now_playing_embed_for_view(
 
 fn build_control_row(
     snapshot: &GuildPlayerSnapshot,
+    generation: u64,
     language: BotLanguage,
     panel_inactive: bool,
 ) -> CreateActionRow {
@@ -507,6 +541,7 @@ fn build_control_row(
     CreateActionRow::Buttons(vec![
         control_button(
             PREVIOUS_CONTROL_ID,
+            generation,
             previous,
             "⏮️",
             ButtonStyle::Secondary,
@@ -514,11 +549,13 @@ fn build_control_row(
         ),
         toggle_button(
             snapshot.playback_state,
+            generation,
             language,
             panel_inactive || no_active_track,
         ),
         control_button(
             SKIP_CONTROL_ID,
+            generation,
             next,
             "⏭️",
             ButtonStyle::Secondary,
@@ -526,6 +563,7 @@ fn build_control_row(
         ),
         control_button(
             STOP_CONTROL_ID,
+            generation,
             stop,
             "⏹️",
             ButtonStyle::Danger,
@@ -536,6 +574,7 @@ fn build_control_row(
 
 fn toggle_button(
     playback_state: PlaybackState,
+    generation: u64,
     language: BotLanguage,
     disabled: bool,
 ) -> CreateButton {
@@ -547,6 +586,7 @@ fn toggle_button(
     };
     control_button(
         TOGGLE_CONTROL_ID,
+        generation,
         label,
         emoji,
         ButtonStyle::Primary,
@@ -556,12 +596,13 @@ fn toggle_button(
 
 fn control_button(
     custom_id: &'static str,
+    generation: u64,
     label: &'static str,
     emoji: &'static str,
     style: ButtonStyle,
     disabled: bool,
 ) -> CreateButton {
-    CreateButton::new(custom_id)
+    CreateButton::new(format!("{custom_id}:{generation}"))
         .label(label)
         .emoji(ReactionType::Unicode(emoji.to_owned()))
         .style(style)

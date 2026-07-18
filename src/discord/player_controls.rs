@@ -39,14 +39,20 @@ struct ControlOutcome {
     feedback: String,
 }
 
+struct PlayerControlRequest {
+    control: PlayerControl,
+    generation: Option<u64>,
+}
+
 pub async fn dispatch(
     context: &Context,
     interaction: &ComponentInteraction,
     state: &Arc<AppState>,
 ) {
-    let Some(control) = PlayerControl::from_custom_id(&interaction.data.custom_id) else {
+    let Some(request) = PlayerControlRequest::from_custom_id(&interaction.data.custom_id) else {
         return;
     };
+    let control = request.control;
     log_received(interaction, control);
     if let Err(source) = interaction.defer_ephemeral(&context.http).await {
         log_discord_error(interaction, control, &source, "defer player control");
@@ -54,12 +60,13 @@ pub async fn dispatch(
     }
 
     let language = state.config.bot_language;
+    if !interaction_is_active(interaction, state, request.generation).await {
+        edit_feedback(context, interaction, stale_panel_message(language), control).await;
+        return;
+    }
     let result = run_control(context, interaction, state, control, language).await;
     match result {
         Ok((outcome, _player)) => {
-            if let Some(guild_id) = interaction.guild_id {
-                state.player_panels.refresh(guild_id).await;
-            }
             edit_feedback(context, interaction, &outcome.feedback, control).await;
             info!(
                 guild_id = ?interaction.guild_id,
@@ -70,6 +77,25 @@ pub async fn dispatch(
         }
         Err(source) => respond_error(context, interaction, source, control, language).await,
     }
+}
+
+async fn interaction_is_active(
+    interaction: &ComponentInteraction,
+    state: &AppState,
+    generation: Option<u64>,
+) -> bool {
+    let (Some(guild_id), Some(generation)) = (interaction.guild_id, generation) else {
+        return false;
+    };
+    state
+        .player_panels
+        .interaction_is_active(
+            guild_id,
+            interaction.channel_id,
+            interaction.message.id,
+            generation,
+        )
+        .await
 }
 
 async fn run_control(
@@ -278,6 +304,17 @@ fn toggle_feedback(
     }
 }
 
+fn stale_panel_message(language: BotLanguage) -> &'static str {
+    match language {
+        BotLanguage::PtBr => {
+            "Este painel não está mais ativo. Use o painel mais recente ou `/queue`."
+        }
+        BotLanguage::EnUs => {
+            "This player panel is no longer active. Use the latest panel or `/queue`."
+        }
+    }
+}
+
 fn feedback_title(track: &QueuedTrack) -> String {
     truncate_text(&track.track.title, MAX_FEEDBACK_TITLE_CHARS)
 }
@@ -307,9 +344,26 @@ fn log_discord_error(
     );
 }
 
-impl PlayerControl {
+impl PlayerControlRequest {
     fn from_custom_id(custom_id: &str) -> Option<Self> {
-        match custom_id {
+        if let Some(control) = PlayerControl::from_base_id(custom_id) {
+            return Some(Self {
+                control,
+                generation: None,
+            });
+        }
+        let (control_id, generation) = custom_id.rsplit_once(':')?;
+        let control = PlayerControl::from_base_id(control_id)?;
+        Some(Self {
+            control,
+            generation: generation.parse().ok(),
+        })
+    }
+}
+
+impl PlayerControl {
+    fn from_base_id(control_id: &str) -> Option<Self> {
+        match control_id {
             PREVIOUS_CONTROL_ID => Some(Self::Previous),
             TOGGLE_CONTROL_ID => Some(Self::Toggle),
             SKIP_CONTROL_ID => Some(Self::Skip),

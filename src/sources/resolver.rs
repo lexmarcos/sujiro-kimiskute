@@ -4,9 +4,23 @@ use crate::{error::AppError, player::track::ResolvedTrack};
 
 pub const MAX_TRACK_INPUT_CHARS: u16 = 500;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum TrackInputKind {
+    Search,
+    Track,
+    Collection,
+}
+
+pub struct TrackResolution {
+    pub tracks: Vec<ResolvedTrack>,
+    pub unavailable: usize,
+}
+
 #[async_trait]
 pub trait TrackResolver: Send + Sync {
-    async fn resolve(&self, input: &str) -> Result<Vec<ResolvedTrack>, AppError>;
+    fn classify(&self, input: &str) -> Result<TrackInputKind, AppError>;
+
+    async fn resolve(&self, input: &str) -> Result<TrackResolution, AppError>;
 
     async fn prepare_stream(&self, track: &ResolvedTrack) -> Result<String, AppError>;
 }

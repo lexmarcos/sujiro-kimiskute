@@ -15,6 +15,7 @@ pub(super) struct CurrentTrack {
     pub track: QueuedTrack,
     pub playback_id: u64,
     pub session_epoch: u64,
+    pub recovery_attempted: bool,
     pub handle: Option<TrackHandle>,
 }
 
@@ -45,6 +46,15 @@ pub(crate) struct ClaimedPlayback {
     pub track: QueuedTrack,
 }
 
+pub(crate) enum PlaybackRecoveryClaim {
+    Stale,
+    Retry(ClaimedPlayback),
+    Skip {
+        track: QueuedTrack,
+        claimed_advancer: bool,
+    },
+}
+
 pub(crate) struct SkippedPlayback {
     pub track: QueuedTrack,
     pub handle: Option<TrackHandle>,
@@ -60,7 +70,7 @@ pub(crate) enum PlaybackSkipClaim {
 
 pub(crate) enum PreviousPlaybackClaim {
     NoPrevious,
-    Ready(PreviousPlayback),
+    Ready(Box<PreviousPlayback>),
 }
 
 pub(crate) struct PreviousPlayback {

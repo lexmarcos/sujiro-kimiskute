@@ -3,8 +3,9 @@ use crate::{
     error::AppError,
     player::{
         lifecycle::{
-            AutoLeaveCancellation, AutoLeaveTimer, AutoLeaveToken, LeaveClaim, LeaveOperation,
-            PlayerLifecycle, closing_error,
+            AutoLeaveCancellation, AutoLeaveTimer, AutoLeaveToken, IdleLeaveCancellation,
+            IdleLeaveTimer, IdleLeaveToken, LeaveClaim, LeaveOperation, PlayerLifecycle,
+            closing_error,
         },
         playback_state::PlaybackState,
     },
@@ -20,7 +21,10 @@ impl GuildPlayer {
         let auto_leave_abort = state
             .invalidate_auto_leave()
             .and_then(|timer| timer.abort_handle);
-        LeaveClaim::Ready(state.begin_leave(auto_leave_abort))
+        let idle_leave_abort = state
+            .invalidate_idle_leave()
+            .and_then(|timer| timer.abort_handle);
+        LeaveClaim::Ready(state.begin_leave(auto_leave_abort, idle_leave_abort))
     }
 
     pub(crate) async fn cancel_auto_leave_for_activity(
@@ -34,6 +38,74 @@ impl GuildPlayer {
     pub(crate) async fn cancel_auto_leave_timer(&self) -> AutoLeaveCancellation {
         let mut state = self.inner.lock().await;
         cancellation_from(state.invalidate_auto_leave())
+    }
+
+    pub(crate) async fn cancel_idle_leave_for_activity(
+        &self,
+    ) -> Result<IdleLeaveCancellation, AppError> {
+        let mut state = self.inner.lock().await;
+        state.ensure_active(self.guild_id)?;
+        Ok(idle_cancellation_from(state.invalidate_idle_leave()))
+    }
+
+    pub(crate) async fn cancel_idle_leave_timer(&self) -> IdleLeaveCancellation {
+        let mut state = self.inner.lock().await;
+        idle_cancellation_from(state.invalidate_idle_leave())
+    }
+
+    pub(crate) async fn claim_idle_leave_timer(&self) -> Option<IdleLeaveToken> {
+        let mut state = self.inner.lock().await;
+        if !state.idle_leave_eligible() || state.idle_leave_timer.is_some() {
+            return None;
+        }
+        if self.play_requests.has_outstanding_work().await {
+            return None;
+        }
+
+        state.idle_leave_generation = state.idle_leave_generation.wrapping_add(1);
+        let token = IdleLeaveToken {
+            generation: state.idle_leave_generation,
+        };
+        state.idle_leave_timer = Some(IdleLeaveTimer {
+            token,
+            abort_handle: None,
+        });
+        Some(token)
+    }
+
+    pub(crate) async fn install_idle_leave_abort(
+        &self,
+        token: IdleLeaveToken,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> Option<tokio::task::AbortHandle> {
+        let mut state = self.inner.lock().await;
+        let Some(timer) = state.idle_leave_timer.as_mut() else {
+            return Some(abort_handle);
+        };
+        if timer.token != token {
+            return Some(abort_handle);
+        }
+        timer.abort_handle = Some(abort_handle);
+        None
+    }
+
+    pub(crate) async fn claim_idle_leave_expiration(
+        &self,
+        token: IdleLeaveToken,
+    ) -> Option<LeaveOperation> {
+        let mut state = self.inner.lock().await;
+        if !state.idle_leave_matches(token) {
+            return None;
+        }
+        state.remove_expiring_idle_leave(token);
+        if !state.idle_leave_eligible() || self.play_requests.has_outstanding_work().await {
+            return None;
+        }
+
+        let auto_leave_abort = state
+            .invalidate_auto_leave()
+            .and_then(|timer| timer.abort_handle);
+        Some(state.begin_leave(auto_leave_abort, None))
     }
 
     pub(crate) async fn claim_auto_leave_timer(
@@ -98,7 +170,10 @@ impl GuildPlayer {
         }
 
         state.invalidate_auto_leave();
-        Some(state.begin_leave(None))
+        let idle_leave_abort = state
+            .invalidate_idle_leave()
+            .and_then(|timer| timer.abort_handle);
+        Some(state.begin_leave(None, idle_leave_abort))
     }
 
     pub(crate) async fn reopen_after_failed_leave(&self, session_epoch: u64) -> bool {
@@ -113,6 +188,36 @@ impl GuildPlayer {
 }
 
 impl GuildPlayerState {
+    fn idle_leave_eligible(&self) -> bool {
+        self.lifecycle == PlayerLifecycle::Active
+            && matches!(
+                self.voice_connection,
+                crate::player::voice_state::VoiceConnectionState::Connected { .. }
+            )
+            && self.current.is_none()
+            && self.queue.is_empty()
+            && self.playback_state == PlaybackState::Idle
+            && !self.queue_advancer_active
+    }
+
+    fn idle_leave_matches(&self, token: IdleLeaveToken) -> bool {
+        self.idle_leave_timer
+            .as_ref()
+            .is_some_and(|timer| timer.token == token)
+    }
+
+    fn invalidate_idle_leave(&mut self) -> Option<IdleLeaveTimer> {
+        self.idle_leave_generation = self.idle_leave_generation.wrapping_add(1);
+        self.idle_leave_timer.take()
+    }
+
+    fn remove_expiring_idle_leave(&mut self, token: IdleLeaveToken) {
+        if self.idle_leave_matches(token) {
+            self.idle_leave_generation = self.idle_leave_generation.wrapping_add(1);
+            self.idle_leave_timer.take();
+        }
+    }
+
     fn auto_leave_matches(&self, token: AutoLeaveToken) -> bool {
         self.auto_leave_timer
             .as_ref()
@@ -127,6 +232,7 @@ impl GuildPlayerState {
     fn begin_leave(
         &mut self,
         auto_leave_abort: Option<tokio::task::AbortHandle>,
+        idle_leave_abort: Option<tokio::task::AbortHandle>,
     ) -> LeaveOperation {
         self.lifecycle = PlayerLifecycle::Closing;
         self.session_epoch = self.session_epoch.wrapping_add(1);
@@ -143,6 +249,7 @@ impl GuildPlayerState {
             removed_from_queue,
             session_epoch: self.session_epoch,
             auto_leave_abort,
+            idle_leave_abort,
         }
     }
 
@@ -154,6 +261,13 @@ impl GuildPlayerState {
             return Ok(());
         }
         Err(closing_error(guild_id))
+    }
+}
+
+fn idle_cancellation_from(timer: Option<IdleLeaveTimer>) -> IdleLeaveCancellation {
+    IdleLeaveCancellation {
+        canceled: timer.is_some(),
+        abort_handle: timer.and_then(|timer| timer.abort_handle),
     }
 }
 

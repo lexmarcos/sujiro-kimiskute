@@ -9,7 +9,7 @@ use crate::{
 
 use super::{guild_only_message, respond};
 use crate::discord::player_panel::{
-    control_row, now_playing_embed, now_playing_message, upcoming_tracks,
+    PanelView, now_playing_embed, now_playing_message, upcoming_tracks,
 };
 
 pub fn definition(language: BotLanguage) -> CreateCommand {
@@ -32,7 +32,24 @@ pub async fn run(
     let Some(snapshot) = queue_snapshot(state, guild_id).await else {
         return respond(context, command, empty_queue_message(language), false).await;
     };
-    respond_with_snapshot(context, command, &snapshot, language).await
+    let message = respond_with_snapshot(
+        context,
+        command,
+        &snapshot,
+        language,
+        state.config.player_panel_update_interval.is_some(),
+    )
+    .await?;
+    state
+        .player_panels
+        .register(
+            guild_id,
+            message.channel_id,
+            message.id,
+            PanelView::Detailed,
+        )
+        .await;
+    Ok(())
 }
 
 async fn queue_snapshot(state: &AppState, guild_id: GuildId) -> Option<GuildPlayerSnapshot> {
@@ -49,18 +66,19 @@ async fn respond_with_snapshot(
     command: &CommandInteraction,
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
-) -> Result<(), serenity::Error> {
-    let message = match now_playing_embed(snapshot, language) {
+    progress_enabled: bool,
+) -> Result<serenity::all::Message, serenity::Error> {
+    let message = match now_playing_embed(snapshot, language, progress_enabled) {
         Some(embed) => CreateInteractionResponseMessage::new()
             .content(now_playing_message(language))
-            .embed(embed)
-            .components(vec![control_row(snapshot, language)]),
+            .embed(embed),
         None => CreateInteractionResponseMessage::new()
             .content(waiting_queue_message(snapshot, language)),
     };
     command
         .create_response(&context.http, CreateInteractionResponse::Message(message))
-        .await
+        .await?;
+    command.get_response(&context.http).await
 }
 
 fn waiting_queue_message(snapshot: &GuildPlayerSnapshot, language: BotLanguage) -> String {

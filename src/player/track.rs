@@ -6,6 +6,7 @@ pub struct ResolvedTrack {
     pub title: String,
     pub webpage_url: String,
     pub duration_seconds: Option<u64>,
+    pub start_at_seconds: Option<u64>,
     pub channel_name: Option<String>,
     pub thumbnail_url: Option<String>,
 }

@@ -4,9 +4,9 @@ use tracing::info;
 use super::GuildPlayer;
 use crate::{
     error::AppError,
-    player::{
-        play_requests::{PendingPlayRequest, PlayRequestReservation, PlayRequestTicket},
-        track::ResolvedTrack,
+    player::play_requests::{
+        PendingPlayRequest, PlayRequestAbandonment, PlayRequestCancellation,
+        PlayRequestReservation, PlayRequestTicket,
     },
 };
 
@@ -29,12 +29,41 @@ impl GuildPlayer {
         state.ensure_active(self.guild_id).is_ok() && state.session_epoch == session_epoch
     }
 
+    pub async fn install_play_request_abort(
+        &self,
+        reservation: PlayRequestReservation,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> bool {
+        self.play_requests
+            .install_abort_handle(reservation, abort_handle)
+            .await
+    }
+
     pub async fn publish_play_resolution(
         &self,
         reservation: PlayRequestReservation,
-        resolution: Result<Vec<ResolvedTrack>, AppError>,
+        resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
     ) -> bool {
         self.play_requests.publish(reservation, resolution).await
+    }
+
+    pub async fn cancel_play_request(
+        &self,
+        reservation: PlayRequestReservation,
+        requested_by: UserId,
+    ) -> PlayRequestCancellation {
+        self.play_requests.cancel(reservation, requested_by).await
+    }
+
+    pub(crate) async fn abandon_play_request(
+        &self,
+        reservation: PlayRequestReservation,
+    ) -> PlayRequestAbandonment {
+        self.play_requests.abandon(reservation).await
+    }
+
+    pub(crate) async fn has_outstanding_play_requests(&self) -> bool {
+        self.play_requests.has_outstanding_work().await
     }
 
     pub async fn take_next_play_request(&self) -> Option<PendingPlayRequest> {

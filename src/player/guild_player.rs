@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::{
     error::AppError,
     player::{
-        lifecycle::{AutoLeaveTimer, PlayerLifecycle},
+        lifecycle::{AutoLeaveTimer, IdleLeaveTimer, PlayerLifecycle},
         play_requests::PlayRequestSequencer,
         playback_state::{CurrentTrack, PlaybackOperation, PlaybackState},
         queue::TrackQueue,
@@ -30,6 +30,10 @@ pub struct GuildPlayerSnapshot {
     pub current: Option<QueuedTrack>,
     pub queued: Vec<QueuedTrack>,
     pub playback_state: PlaybackState,
+    pub position_seconds: Option<u64>,
+    pub remaining_known_seconds: u64,
+    pub unknown_duration_tracks: usize,
+    pub has_previous: bool,
     pub session_epoch: u64,
     pub playback_id: u64,
 }
@@ -56,6 +60,8 @@ struct GuildPlayerState {
     lifecycle: PlayerLifecycle,
     auto_leave_generation: u64,
     auto_leave_timer: Option<AutoLeaveTimer>,
+    idle_leave_generation: u64,
+    idle_leave_timer: Option<IdleLeaveTimer>,
 }
 
 impl GuildPlayer {
@@ -81,6 +87,8 @@ impl GuildPlayer {
                 lifecycle: PlayerLifecycle::Active,
                 auto_leave_generation: 0,
                 auto_leave_timer: None,
+                idle_leave_generation: 0,
+                idle_leave_timer: None,
             }),
             voice_change: Notify::new(),
             play_requests: PlayRequestSequencer::new(),
@@ -113,15 +121,32 @@ impl GuildPlayer {
     }
 
     pub async fn snapshot(&self) -> GuildPlayerSnapshot {
-        let state = self.inner.lock().await;
-        GuildPlayerSnapshot {
-            voice_channel_id: state.voice_channel_id,
-            current: state.current.as_ref().map(|current| current.track.clone()),
-            queued: state.queue.iter().cloned().collect(),
-            playback_state: state.playback_state,
-            session_epoch: state.session_epoch,
-            playback_id: state.playback_id,
+        let (mut snapshot, handle) = {
+            let state = self.inner.lock().await;
+            let snapshot = GuildPlayerSnapshot {
+                voice_channel_id: state.voice_channel_id,
+                current: state.current.as_ref().map(|current| current.track.clone()),
+                queued: state.queue.iter().cloned().collect(),
+                playback_state: state.playback_state,
+                position_seconds: None,
+                remaining_known_seconds: remaining_known_seconds(&state),
+                unknown_duration_tracks: unknown_duration_tracks(&state),
+                has_previous: !state.history.is_empty(),
+                session_epoch: state.session_epoch,
+                playback_id: state.playback_id,
+            };
+            let handle = state
+                .current
+                .as_ref()
+                .and_then(|current| current.handle.clone());
+            (snapshot, handle)
+        };
+        if let Some(handle) = handle
+            && let Ok(track_state) = handle.get_info().await
+        {
+            snapshot.position_seconds = Some(track_state.position.as_secs());
         }
+        snapshot
     }
 
     pub async fn advance_session_epoch(&self) -> u64 {
@@ -301,6 +326,33 @@ impl GuildPlayer {
     }
 }
 
+fn remaining_known_seconds(state: &GuildPlayerState) -> u64 {
+    let current_duration = state
+        .current
+        .as_ref()
+        .and_then(|current| current.track.track.duration_seconds)
+        .unwrap_or(0);
+    let queued_duration = state
+        .queue
+        .iter()
+        .filter_map(|track| track.track.duration_seconds)
+        .fold(0_u64, u64::saturating_add);
+    current_duration.saturating_add(queued_duration)
+}
+
+fn unknown_duration_tracks(state: &GuildPlayerState) -> usize {
+    usize::from(
+        state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.track.track.duration_seconds.is_none()),
+    ) + state
+        .queue
+        .iter()
+        .filter(|track| track.track.duration_seconds.is_none())
+        .count()
+}
+
 impl GuildPlayerState {
     fn begin_playback(&mut self, track: QueuedTrack) -> PlaybackOperation {
         self.playback_id = self.playback_id.wrapping_add(1);
@@ -312,6 +364,7 @@ impl GuildPlayerState {
             track,
             playback_id: operation.playback_id,
             session_epoch: operation.session_epoch,
+            recovery_attempted: false,
             handle: None,
         });
         self.playback_state = PlaybackState::Starting;

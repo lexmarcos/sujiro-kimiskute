@@ -55,6 +55,10 @@ impl PlayerManager {
         self.players.read().await.get(&guild_id).cloned()
     }
 
+    pub async fn all(&self) -> Vec<Arc<GuildPlayer>> {
+        self.players.read().await.values().cloned().collect()
+    }
+
     pub async fn remove(&self, guild_id: GuildId) -> Option<Arc<GuildPlayer>> {
         self.players.write().await.remove(&guild_id)
     }

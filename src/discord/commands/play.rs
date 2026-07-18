@@ -5,25 +5,34 @@ use serenity::{
         Cache, ChannelId, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
         GuildId, UserId,
     },
-    builder::{CreateCommand, CreateCommandOption, EditInteractionResponse},
+    builder::{
+        CreateActionRow, CreateButton, CreateCommand, CreateCommandOption, EditInteractionResponse,
+    },
 };
 use tracing::error;
 
+mod lifecycle;
 use crate::{
     error::{AppError, VoiceChannelIssue},
     localization::BotLanguage,
     player::{
         guild_player::{GuildPlayer, GuildPlayerSnapshot},
-        play_requests::{PlayCommitReceipt, PlayRequestReservation, PlayRequestTicket},
-        track::{QueuedTrack, ResolvedTrack},
+        play_requests::{
+            PlayCommitReceipt, PlayRequestAbandonment, PlayRequestReservation, PlayRequestTicket,
+        },
+        track::QueuedTrack,
     },
-    sources::resolver::{MAX_TRACK_INPUT_CHARS, normalize_track_input},
+    sources::resolver::{MAX_TRACK_INPUT_CHARS, TrackInputKind, normalize_track_input},
     state::AppState,
     voice::VoiceConnection,
 };
+pub(crate) use lifecycle::{drain_ready_requests, refresh_if_quiescent, spawn_drainer};
 
 use super::{MAX_RESPONSE_CHARS, guild_only_message, respond, respond_app_error, truncate_text};
-use crate::discord::player_panel::{control_row, format_duration, now_playing_embed};
+use crate::discord::{
+    play_requests::CANCEL_PLAY_PREFIX,
+    player_panel::{PanelView, format_duration, now_playing_embed},
+};
 
 const MAX_TITLE_CHARS: usize = 160;
 
@@ -69,11 +78,16 @@ pub async fn run(
     };
 
     command.defer(&context.http).await?;
+    let input_kind = match state.track_resolver.classify(&query) {
+        Ok(input_kind) => input_kind,
+        Err(error) => return edit_error(context, command, error, language).await,
+    };
     let player = match state.players.get_or_create(guild_id).await {
         Ok(player) => player,
         Err(error) => return edit_error(context, command, error, language).await,
     };
-    if let Err(error) = state.auto_leave.cancel_for_activity(&player).await {
+    if let Err(error) = cancel_leave_timers(state, &player).await {
+        refresh_leave_timers(context, state, guild_id).await;
         return edit_error(context, command, error, language).await;
     }
     let ticket = match player
@@ -81,15 +95,37 @@ pub async fn run(
         .await
     {
         Ok(ticket) => ticket,
-        Err(error) => return edit_error(context, command, error, language).await,
+        Err(error) => {
+            refresh_leave_timers(context, state, guild_id).await;
+            return edit_error(context, command, error, language).await;
+        }
     };
-    spawn_resolution(context, state, &player, ticket.reservation, query);
+    if let Err(source) =
+        edit_loading(context, command, ticket.reservation, input_kind, language).await
+    {
+        handle_loading_failure(context, state, &player, ticket.reservation).await;
+        return Err(source);
+    }
+    spawn_resolution(context, state, &player, ticket.reservation, query).await;
     let commit = wait_for_commit(ticket).await;
 
     match commit {
         Ok(receipt) => {
             let snapshot = player.snapshot().await;
-            edit_success(context, command, receipt, &snapshot, language).await
+            let message = edit_success(
+                context,
+                command,
+                receipt,
+                &snapshot,
+                language,
+                state.config.player_panel_update_interval.is_some(),
+            )
+            .await?;
+            state
+                .player_panels
+                .register(guild_id, message.channel_id, message.id, PanelView::Compact)
+                .await;
+            Ok(())
         }
         Err(error) => {
             error!(
@@ -98,12 +134,32 @@ pub async fn run(
                 error = %error,
                 "play command failed"
             );
+            refresh_if_quiescent(context, state, &player).await;
             edit_error(context, command, error, language).await
         }
     }
 }
 
-fn spawn_resolution(
+async fn handle_loading_failure(
+    context: &Context,
+    state: &Arc<AppState>,
+    player: &Arc<GuildPlayer>,
+    reservation: PlayRequestReservation,
+) {
+    match player.abandon_play_request(reservation).await {
+        PlayRequestAbandonment::Abandoned { should_drain: true } => {
+            spawn_drainer(context, state, Arc::clone(player));
+        }
+        PlayRequestAbandonment::Abandoned {
+            should_drain: false,
+        }
+        | PlayRequestAbandonment::NotFound => {
+            refresh_if_quiescent(context, state, player).await;
+        }
+    }
+}
+
+async fn spawn_resolution(
     context: &Context,
     state: &Arc<AppState>,
     player: &Arc<GuildPlayer>,
@@ -112,18 +168,26 @@ fn spawn_resolution(
 ) {
     let resolver = Arc::clone(&state.track_resolver);
     let resolution_task = tokio::spawn(async move { resolver.resolve(&query).await });
+    if !player
+        .install_play_request_abort(reservation, resolution_task.abort_handle())
+        .await
+    {
+        return;
+    }
     let cache = Arc::clone(&context.cache);
     let state = Arc::clone(state);
     let weak_player = Arc::downgrade(player);
     drop(tokio::spawn(async move {
-        let resolution = resolution_task.await.unwrap_or_else(|source| {
-            Err(AppError::Internal {
+        let resolution = match resolution_task.await {
+            Ok(resolution) => resolution,
+            Err(source) if source.is_cancelled() => return,
+            Err(source) => Err(AppError::Internal {
                 context: format!(
                     "play resolution task for sequence {} failed: {source}",
                     reservation.sequence
                 ),
-            })
-        });
+            }),
+        };
         let Some(player) = weak_player.upgrade() else {
             return;
         };
@@ -136,6 +200,47 @@ fn spawn_resolution(
     }));
 }
 
+async fn edit_loading(
+    context: &Context,
+    command: &CommandInteraction,
+    reservation: PlayRequestReservation,
+    input_kind: TrackInputKind,
+    language: BotLanguage,
+) -> Result<(), serenity::Error> {
+    let content = loading_message(input_kind, language);
+    let mut response = EditInteractionResponse::new().content(content);
+    if input_kind == TrackInputKind::Collection {
+        let custom_id = format!(
+            "{CANCEL_PLAY_PREFIX}{}:{}",
+            reservation.sequence, reservation.session_epoch
+        );
+        let label = match language {
+            BotLanguage::PtBr => "Cancelar",
+            BotLanguage::EnUs => "Cancel",
+        };
+        response = response.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(custom_id)
+                .label(label)
+                .style(serenity::all::ButtonStyle::Secondary),
+        ])]);
+    }
+    command.edit_response(&context.http, response).await?;
+    Ok(())
+}
+
+fn loading_message(input_kind: TrackInputKind, language: BotLanguage) -> &'static str {
+    match (language, input_kind) {
+        (BotLanguage::PtBr, TrackInputKind::Collection) => {
+            "⏳ Carregando a playlist e verificando as músicas…"
+        }
+        (BotLanguage::PtBr, _) => "⏳ Procurando e preparando a música…",
+        (BotLanguage::EnUs, TrackInputKind::Collection) => {
+            "⏳ Loading the playlist and checking its tracks…"
+        }
+        (BotLanguage::EnUs, _) => "⏳ Finding and preparing the track…",
+    }
+}
+
 async fn wait_for_commit(ticket: PlayRequestTicket) -> Result<PlayCommitReceipt, AppError> {
     ticket.response.await.map_err(|_| AppError::Internal {
         context: format!(
@@ -145,45 +250,40 @@ async fn wait_for_commit(ticket: PlayRequestTicket) -> Result<PlayCommitReceipt,
     })?
 }
 
-async fn drain_ready_requests(cache: Arc<Cache>, state: Arc<AppState>, player: Arc<GuildPlayer>) {
-    while let Some(request) = player.take_next_play_request().await {
-        let sequence = request.reservation.sequence;
-        let response = request.response;
-        let commit = CommitRequest {
-            reservation: request.reservation,
-            channel_id: request.channel_id,
-            requested_by: request.requested_by,
-            resolution: request.resolution,
-        };
-        let result = commit_request(&cache, &state, &player, commit).await;
-        if response.send(result).is_err() {
-            error!(
-                guild_id = %player.guild_id(),
-                sequence,
-                "play request receiver was dropped"
-            );
-        }
-    }
+async fn cancel_leave_timers(state: &AppState, player: &GuildPlayer) -> Result<(), AppError> {
+    state.auto_leave.cancel_for_activity(player).await?;
+    state.idle_leave.cancel_for_activity(player).await
+}
+async fn refresh_leave_timers(context: &Context, state: &AppState, guild_id: GuildId) {
+    state.idle_leave.refresh(guild_id).await;
+    state
+        .auto_leave
+        .refresh(Arc::clone(&context.cache), guild_id)
+        .await;
 }
 
-struct CommitRequest {
-    reservation: PlayRequestReservation,
-    channel_id: ChannelId,
-    requested_by: UserId,
-    resolution: Result<Vec<ResolvedTrack>, AppError>,
+pub(super) struct CommitRequest {
+    pub reservation: PlayRequestReservation,
+    pub channel_id: ChannelId,
+    pub requested_by: UserId,
+    pub resolution: Result<crate::sources::resolver::TrackResolution, AppError>,
 }
 
-async fn commit_request(
+pub(super) async fn commit_request(
     cache: &Cache,
     state: &AppState,
     player: &Arc<GuildPlayer>,
     request: CommitRequest,
 ) -> Result<PlayCommitReceipt, AppError> {
     validate_commit_state(state, player, request.reservation).await?;
-    let tracks = request.resolution?;
-    let first_track = tracks.first().cloned().ok_or(AppError::Resolution {
-        context: "YouTube resolver returned no tracks".to_owned(),
-    })?;
+    let resolution = request.resolution?;
+    let first_track = resolution
+        .tracks
+        .first()
+        .cloned()
+        .ok_or(AppError::Resolution {
+            context: "YouTube resolver returned no tracks".to_owned(),
+        })?;
 
     revalidate_user_channel(
         cache,
@@ -203,7 +303,9 @@ async fn commit_request(
         request.channel_id,
     )?;
 
-    let queued = tracks
+    let unavailable = resolution.unavailable;
+    let queued = resolution
+        .tracks
         .into_iter()
         .map(|track| QueuedTrack {
             track,
@@ -224,6 +326,7 @@ async fn commit_request(
         requested_by: request.requested_by,
         first_position,
         added: receipt.added,
+        unavailable,
         omitted: receipt.omitted,
     })
 }
@@ -293,16 +396,18 @@ async fn edit_success(
     receipt: PlayCommitReceipt,
     snapshot: &GuildPlayerSnapshot,
     language: BotLanguage,
-) -> Result<(), serenity::Error> {
-    let response = match now_playing_embed(snapshot, language) {
+    progress_enabled: bool,
+) -> Result<serenity::all::Message, serenity::Error> {
+    let response = match now_playing_embed(snapshot, language, progress_enabled) {
         Some(embed) => EditInteractionResponse::new()
             .content(success_message(&receipt, language))
             .embed(embed)
-            .components(vec![control_row(snapshot, language)]),
-        None => EditInteractionResponse::new().content(success_message(&receipt, language)),
+            .components(Vec::new()),
+        None => EditInteractionResponse::new()
+            .content(success_message(&receipt, language))
+            .components(Vec::new()),
     };
-    command.edit_response(&context.http, response).await?;
-    Ok(())
+    command.edit_response(&context.http, response).await
 }
 
 async fn edit_error(
@@ -314,7 +419,9 @@ async fn edit_error(
     command
         .edit_response(
             &context.http,
-            EditInteractionResponse::new().content(error.discord_message(language)),
+            EditInteractionResponse::new()
+                .content(error.discord_message(language))
+                .components(Vec::new()),
         )
         .await?;
     Ok(())
@@ -329,38 +436,59 @@ fn success_message(receipt: &PlayCommitReceipt, language: BotLanguage) -> String
     let requester = format!("<@{}>", receipt.requested_by);
     let title = truncate_text(&receipt.first_track.title, MAX_TITLE_CHARS);
 
-    let omitted = omitted_message(receipt.omitted, language);
+    let notes = resolution_notes(receipt.unavailable, receipt.omitted, language);
     let message = match (language, receipt.added) {
         (BotLanguage::PtBr, 1) => format!(
-            "✅ **{title}** adicionada à fila{duration}.\n📍 Posição: **{}** · Solicitada por {requester}{omitted}",
+            "✅ **{title}** adicionada à fila{duration}.\n📍 Posição: **{}** · Solicitada por {requester}{notes}",
             receipt.first_position
         ),
         (BotLanguage::PtBr, _) => format!(
-            "✅ **{} músicas** adicionadas à fila.\n🎵 Primeira: **{title}**{duration}\n📍 Começa na posição **{}** · Solicitada por {requester}{omitted}",
+            "✅ **{} músicas** adicionadas à fila.\n🎵 Primeira: **{title}**{duration}\n📍 Começa na posição **{}** · Solicitada por {requester}{notes}",
             receipt.added, receipt.first_position
         ),
         (BotLanguage::EnUs, 1) => format!(
-            "✅ **{title}** added to the queue{duration}.\n📍 Position: **{}** · Requested by {requester}{omitted}",
+            "✅ **{title}** added to the queue{duration}.\n📍 Position: **{}** · Requested by {requester}{notes}",
             receipt.first_position
         ),
         (BotLanguage::EnUs, _) => format!(
-            "✅ **{} tracks** added to the queue.\n🎵 First: **{title}**{duration}\n📍 Starts at position **{}** · Requested by {requester}{omitted}",
+            "✅ **{} tracks** added to the queue.\n🎵 First: **{title}**{duration}\n📍 Starts at position **{}** · Requested by {requester}{notes}",
             receipt.added, receipt.first_position
         ),
     };
     truncate_text(&message, MAX_RESPONSE_CHARS)
 }
 
-fn omitted_message(omitted: usize, language: BotLanguage) -> String {
-    match (language, omitted) {
-        (_, 0) => String::new(),
-        (BotLanguage::PtBr, 1) => "\n⚠️ 1 música não coube no limite da fila.".to_owned(),
-        (BotLanguage::PtBr, count) => {
-            format!("\n⚠️ {count} músicas não couberam no limite da fila.")
-        }
-        (BotLanguage::EnUs, 1) => "\n⚠️ 1 track did not fit within the queue limit.".to_owned(),
-        (BotLanguage::EnUs, count) => {
-            format!("\n⚠️ {count} tracks did not fit within the queue limit.")
-        }
+fn resolution_notes(unavailable: usize, omitted: usize, language: BotLanguage) -> String {
+    let mut notes = String::new();
+    if unavailable > 0 {
+        let message = match (language, unavailable) {
+            (BotLanguage::PtBr, 1) => "1 música indisponível foi ignorada".to_owned(),
+            (BotLanguage::PtBr, count) => {
+                format!("{count} músicas indisponíveis foram ignoradas")
+            }
+            (BotLanguage::EnUs, 1) => "1 unavailable track was skipped".to_owned(),
+            (BotLanguage::EnUs, count) => {
+                format!("{count} unavailable tracks were skipped")
+            }
+        };
+        notes.push_str("\n⚠️ ");
+        notes.push_str(&message);
+        notes.push('.');
     }
+    if omitted > 0 {
+        let message = match (language, omitted) {
+            (BotLanguage::PtBr, 1) => "1 música não coube no limite da fila".to_owned(),
+            (BotLanguage::PtBr, count) => {
+                format!("{count} músicas não couberam no limite da fila")
+            }
+            (BotLanguage::EnUs, 1) => "1 track did not fit within the queue limit".to_owned(),
+            (BotLanguage::EnUs, count) => {
+                format!("{count} tracks did not fit within the queue limit")
+            }
+        };
+        notes.push_str("\n⚠️ ");
+        notes.push_str(&message);
+        notes.push('.');
+    }
+    notes
 }

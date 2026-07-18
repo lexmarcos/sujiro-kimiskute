@@ -20,7 +20,7 @@ impl PlaybackService {
         self.validate_player(&player).await?;
         let previous = match player.claim_previous().await? {
             PreviousPlaybackClaim::NoPrevious => return Ok(PlaybackPreviousResult::NoPrevious),
-            PreviousPlaybackClaim::Ready(previous) => previous,
+            PreviousPlaybackClaim::Ready(previous) => *previous,
         };
         self.start_previous_track(player, previous).await
     }

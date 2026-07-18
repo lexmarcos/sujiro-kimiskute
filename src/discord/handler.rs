@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::state::AppState;
 
-use super::{commands, player_controls, presence};
+use super::{commands, play_requests, player_controls};
 
 pub struct DiscordEventHandler {
     state: Arc<AppState>,
@@ -54,9 +54,7 @@ impl EventHandler for DiscordEventHandler {
             "Discord bot ready"
         );
 
-        context.set_activity(Some(presence::activity_data(
-            &self.state.config.bot_activity,
-        )));
+        self.state.presence.initialize(context.shard.clone());
         self.synchronize_commands(&context, &guild_ids).await;
     }
 
@@ -66,7 +64,9 @@ impl EventHandler for DiscordEventHandler {
                 commands::dispatch(&context, &command, &self.state).await;
             }
             Interaction::Component(component) => {
-                player_controls::dispatch(&context, &component, &self.state).await;
+                if !play_requests::dispatch(&context, &component, &self.state).await {
+                    player_controls::dispatch(&context, &component, &self.state).await;
+                }
             }
             _ => {}
         }

@@ -14,9 +14,10 @@ use crate::{
     player::{
         guild_player::GuildPlayer,
         manager::PlayerManager,
+        observer::PlayerObserver,
         playback_state::{
             ClaimedPlayback, PlaybackControl, PlaybackControlClaim, PlaybackOperation,
-            PlaybackSkipClaim, PlaybackState,
+            PlaybackRecoveryClaim, PlaybackSkipClaim, PlaybackState,
         },
         queue::QueueInsertionReceipt,
         track::QueuedTrack,
@@ -34,6 +35,7 @@ pub struct PlaybackService {
     http_client: Client,
     songbird: Arc<Songbird>,
     players: Arc<PlayerManager>,
+    observer: Arc<dyn PlayerObserver>,
 }
 
 impl PlaybackService {
@@ -42,12 +44,14 @@ impl PlaybackService {
         http_client: Client,
         songbird: Arc<Songbird>,
         players: Arc<PlayerManager>,
+        observer: Arc<dyn PlayerObserver>,
     ) -> Arc<Self> {
         Arc::new(Self {
             resolver,
             http_client,
             songbird,
             players,
+            observer,
         })
     }
 
@@ -73,6 +77,7 @@ impl PlaybackService {
         if claimed_advancer {
             self.advance_claimed_queue(Arc::clone(&player)).await;
         }
+        self.observer.player_changed(player.guild_id()).await;
         Ok(position)
     }
 
@@ -89,6 +94,7 @@ impl PlaybackService {
         if claimed_advancer {
             self.advance_claimed_queue(Arc::clone(&player)).await;
         }
+        self.observer.player_changed(player.guild_id()).await;
         Ok(receipt)
     }
 
@@ -145,6 +151,7 @@ impl PlaybackService {
             playback_id = skipped.operation.playback_id,
             "track skipped"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(PlaybackSkipResult::Skipped {
             track: skipped.track,
         })
@@ -173,6 +180,7 @@ impl PlaybackService {
             removed_from_queue = stopped.removed_from_queue,
             "playback stopped and queue cleared"
         );
+        self.observer.player_changed(player.guild_id()).await;
 
         Ok(PlaybackStopResult { removed_tracks })
     }
@@ -217,6 +225,7 @@ impl PlaybackService {
             operation = operation_name,
             "track playback state changed"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(PlaybackControlResult::Changed)
     }
 
@@ -232,6 +241,7 @@ impl PlaybackService {
     ) {
         loop {
             let Some(claimed) = next.take() else {
+                self.observer.player_changed(player.guild_id()).await;
                 return;
             };
             let track_id = claimed.track.track.id.clone();
@@ -270,7 +280,7 @@ impl PlaybackService {
         operation: PlaybackOperation,
         resolved_track: &crate::player::track::ResolvedTrack,
     ) -> Result<(), AppError> {
-        let stream_url = match self.resolver.prepare_stream(resolved_track).await {
+        let stream_url = match self.prepare_stream_with_retry(player, resolved_track).await {
             Ok(url) => url,
             Err(error) => {
                 player.clear_playback(operation).await;
@@ -288,6 +298,20 @@ impl PlaybackService {
                 return Err(error);
             }
         };
+        if let Some(start_at_seconds) = resolved_track.start_at_seconds
+            && let Err(source) = handle
+                .seek_async(Duration::from_secs(start_at_seconds))
+                .await
+        {
+            player.clear_playback(operation).await;
+            stop_created_handle(&handle);
+            return Err(AppError::Voice {
+                context: format!(
+                    "could not seek track {} to {start_at_seconds} seconds: {source}",
+                    resolved_track.id
+                ),
+            });
+        }
         self.start_installed_track(player, operation, &handle)
             .await?;
 
@@ -297,7 +321,27 @@ impl PlaybackService {
             playback_id = operation.playback_id,
             "track playback started"
         );
+        self.observer.player_changed(player.guild_id()).await;
         Ok(())
+    }
+
+    async fn prepare_stream_with_retry(
+        &self,
+        player: &GuildPlayer,
+        track: &crate::player::track::ResolvedTrack,
+    ) -> Result<String, AppError> {
+        match self.resolver.prepare_stream(track).await {
+            Ok(url) => Ok(url),
+            Err(first_error) => {
+                warn!(
+                    guild_id = %player.guild_id(),
+                    track_id = %track.id,
+                    error = %first_error,
+                    "stream preparation failed; retrying once"
+                );
+                self.resolver.prepare_stream(track).await
+            }
+        }
     }
 
     async fn install_paused_track(
@@ -347,7 +391,12 @@ impl PlaybackService {
         track.events.add_event(
             EventData::new(
                 Event::Track(TrackEvent::Error),
-                PlaybackErrorHandler::new(player.guild_id(), player.instance_id(), operation),
+                PlaybackErrorHandler::new(
+                    Arc::downgrade(self),
+                    player.guild_id(),
+                    player.instance_id(),
+                    operation,
+                ),
             ),
             Duration::ZERO,
         );
@@ -371,6 +420,81 @@ impl PlaybackService {
 
         stop_created_handle(handle);
         Err(stale_playback_error())
+    }
+
+    pub(crate) async fn track_failed(
+        self: &Arc<Self>,
+        guild_id: serenity::model::id::GuildId,
+        instance_id: u64,
+        operation: PlaybackOperation,
+    ) {
+        let Some(player) = self.players.get(guild_id).await else {
+            return;
+        };
+        if player.instance_id() != instance_id {
+            return;
+        }
+
+        match player.claim_playback_recovery(operation).await {
+            PlaybackRecoveryClaim::Stale => {}
+            PlaybackRecoveryClaim::Retry(claimed) => {
+                warn!(
+                    guild_id = %guild_id,
+                    track_id = %claimed.track.track.id,
+                    failed_playback_id = operation.playback_id,
+                    retry_playback_id = claimed.operation.playback_id,
+                    "retrying failed track playback"
+                );
+                if let Err(error) = self
+                    .start_claimed_track(&player, claimed.operation, &claimed.track.track)
+                    .await
+                {
+                    warn!(
+                        guild_id = %guild_id,
+                        track_id = %claimed.track.track.id,
+                        playback_id = claimed.operation.playback_id,
+                        error = %error,
+                        "failed track recovery could not restart playback"
+                    );
+                    self.finish_failed_recovery(player, claimed.track).await;
+                }
+            }
+            PlaybackRecoveryClaim::Skip {
+                track,
+                claimed_advancer,
+            } => {
+                warn!(
+                    guild_id = %guild_id,
+                    track_id = %track.track.id,
+                    playback_id = operation.playback_id,
+                    "failed track exhausted recovery and was skipped"
+                );
+                self.observer.track_failed(guild_id, &track).await;
+                self.observer.player_changed(guild_id).await;
+                if claimed_advancer {
+                    let playback = Arc::clone(self);
+                    tokio::spawn(async move {
+                        playback.advance_claimed_queue(player).await;
+                    });
+                }
+            }
+        }
+    }
+
+    async fn finish_failed_recovery(
+        self: &Arc<Self>,
+        player: Arc<GuildPlayer>,
+        track: QueuedTrack,
+    ) {
+        let guild_id = player.guild_id();
+        self.observer.track_failed(guild_id, &track).await;
+        self.observer.player_changed(guild_id).await;
+        if player.claim_queue_advancer().await {
+            let playback = Arc::clone(self);
+            tokio::spawn(async move {
+                playback.advance_claimed_queue(player).await;
+            });
+        }
     }
 
     pub(crate) async fn track_ended(
@@ -397,6 +521,7 @@ impl PlaybackService {
             playback_id = operation.playback_id,
             "track playback ended"
         );
+        self.observer.player_changed(guild_id).await;
 
         if claimed_advancer {
             let playback = Arc::clone(self);

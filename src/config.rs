@@ -8,8 +8,11 @@ const DEFAULT_AUTO_LEAVE_SECONDS: &str = "120";
 const DEFAULT_BOT_ACTIVITY_MESSAGE: &str = "música";
 const DEFAULT_BOT_ACTIVITY_TYPE: &str = "listening";
 const DEFAULT_BOT_LANGUAGE: &str = "pt-BR";
+const DEFAULT_BOT_ACTIVITY_CURRENT_TRACK: &str = "false";
+const DEFAULT_IDLE_LEAVE_SECONDS: &str = "300";
 const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "4";
 const DEFAULT_MAX_QUEUE_SIZE: &str = "50";
+const DEFAULT_PLAYER_PANEL_UPDATE_SECONDS: &str = "5";
 const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_YT_DLP_PATH: &str = "yt-dlp";
 const DEFAULT_YT_DLP_TIMEOUT_SECONDS: &str = "20";
@@ -19,10 +22,13 @@ pub struct AppConfig {
     pub discord_application_id: u64,
     pub bot_language: BotLanguage,
     pub(crate) bot_activity: BotActivityConfig,
+    pub bot_activity_current_track: bool,
     pub yt_dlp_path: PathBuf,
     pub yt_dlp_extra_args: Vec<String>,
     pub yt_dlp_timeout: Duration,
     pub auto_leave_timeout: Duration,
+    pub idle_leave_timeout: Option<Duration>,
+    pub player_panel_update_interval: Option<Duration>,
     pub max_queue_size: usize,
     pub max_concurrent_resolutions: usize,
     pub rust_log: String,
@@ -44,6 +50,10 @@ impl AppConfig {
         )?;
         let bot_language = configured_bot_language()?;
         let bot_activity = configured_bot_activity()?;
+        let bot_activity_current_track = configured_bool(
+            "BOT_ACTIVITY_CURRENT_TRACK",
+            DEFAULT_BOT_ACTIVITY_CURRENT_TRACK,
+        )?;
         let yt_dlp_path = non_empty_value(
             "YT_DLP_PATH",
             optional_value("YT_DLP_PATH", DEFAULT_YT_DLP_PATH)?,
@@ -53,6 +63,12 @@ impl AppConfig {
             configured_duration("YT_DLP_TIMEOUT_SECONDS", DEFAULT_YT_DLP_TIMEOUT_SECONDS)?;
         let auto_leave_timeout =
             configured_duration("AUTO_LEAVE_SECONDS", DEFAULT_AUTO_LEAVE_SECONDS)?;
+        let idle_leave_timeout =
+            configured_optional_duration("IDLE_LEAVE_SECONDS", DEFAULT_IDLE_LEAVE_SECONDS)?;
+        let player_panel_update_interval = configured_optional_duration(
+            "PLAYER_PANEL_UPDATE_SECONDS",
+            DEFAULT_PLAYER_PANEL_UPDATE_SECONDS,
+        )?;
         let max_queue_size = configured_usize("MAX_QUEUE_SIZE", DEFAULT_MAX_QUEUE_SIZE)?;
         let max_concurrent_resolutions = configured_usize(
             "MAX_CONCURRENT_RESOLUTIONS",
@@ -65,10 +81,13 @@ impl AppConfig {
             discord_application_id,
             bot_language,
             bot_activity,
+            bot_activity_current_track,
             yt_dlp_path: PathBuf::from(yt_dlp_path),
             yt_dlp_extra_args,
             yt_dlp_timeout,
             auto_leave_timeout,
+            idle_leave_timeout,
+            player_panel_update_interval,
             max_queue_size,
             max_concurrent_resolutions,
             rust_log,
@@ -103,6 +122,11 @@ pub enum ConfigError {
 
     #[error("environment variable {name} must be positive, received {value}")]
     NotPositive { name: &'static str, value: u64 },
+
+    #[error(
+        "environment variable {name} has invalid boolean value {value:?}; expected true or false"
+    )]
+    InvalidBoolean { name: &'static str, value: String },
 
     #[error("environment variable YT_DLP_EXTRA_ARGS contains unmatched quotes")]
     InvalidExtraArguments,
@@ -196,6 +220,31 @@ fn non_empty_value(name: &'static str, value: String) -> Result<String, ConfigEr
 fn configured_duration(name: &'static str, default: &str) -> Result<Duration, ConfigError> {
     let seconds = positive_u64(name, optional_value(name, default)?)?;
     Ok(Duration::from_secs(seconds))
+}
+
+fn configured_bool(name: &'static str, default: &str) -> Result<bool, ConfigError> {
+    let value = optional_value(name, default)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolean { name, value }),
+    }
+}
+
+fn configured_optional_duration(
+    name: &'static str,
+    default: &str,
+) -> Result<Option<Duration>, ConfigError> {
+    let value = optional_value(name, default)?;
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|source| ConfigError::InvalidInteger {
+            name,
+            value: value.clone(),
+            source,
+        })?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn configured_usize(name: &'static str, default: &str) -> Result<usize, ConfigError> {

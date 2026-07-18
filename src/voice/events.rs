@@ -43,14 +43,21 @@ impl EventHandler for PlaybackEndHandler {
 }
 
 pub(crate) struct PlaybackErrorHandler {
+    playback: Weak<PlaybackService>,
     guild_id: GuildId,
     instance_id: u64,
     operation: PlaybackOperation,
 }
 
 impl PlaybackErrorHandler {
-    pub(crate) fn new(guild_id: GuildId, instance_id: u64, operation: PlaybackOperation) -> Self {
+    pub(crate) fn new(
+        playback: Weak<PlaybackService>,
+        guild_id: GuildId,
+        instance_id: u64,
+        operation: PlaybackOperation,
+    ) -> Self {
         Self {
+            playback,
             guild_id,
             instance_id,
             operation,
@@ -80,6 +87,11 @@ impl EventHandler for PlaybackErrorHandler {
             error = %source,
             "Songbird track playback failed"
         );
+        if let Some(playback) = self.playback.upgrade() {
+            playback
+                .track_failed(self.guild_id, self.instance_id, self.operation)
+                .await;
+        }
         Some(Event::Cancel)
     }
 }

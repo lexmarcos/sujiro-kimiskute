@@ -5,9 +5,14 @@ use tokio::sync::Semaphore;
 
 use crate::{
     config::AppConfig,
+    discord::{player_panel::PlayerPanelService, presence::PresenceService},
     error::AppError,
     player::{
-        auto_leave::AutoLeaveService, manager::PlayerManager, playback::PlaybackService,
+        auto_leave::AutoLeaveService,
+        idle_leave::IdleLeaveService,
+        manager::PlayerManager,
+        observer::{CompositePlayerObserver, PlayerObserver},
+        playback::PlaybackService,
         session::GuildSessionService,
     },
     sources::{
@@ -26,6 +31,9 @@ pub struct AppState {
     pub songbird: Arc<Songbird>,
     pub voice: Arc<VoiceConnection>,
     pub playback: Arc<PlaybackService>,
+    pub player_panels: Arc<PlayerPanelService>,
+    pub presence: Arc<PresenceService>,
+    pub idle_leave: Arc<IdleLeaveService>,
     pub sessions: Arc<GuildSessionService>,
     pub auto_leave: Arc<AutoLeaveService>,
 }
@@ -52,13 +60,39 @@ impl AppState {
             Arc::clone(&songbird),
             Arc::clone(&players),
         ));
+        let player_panels = PlayerPanelService::new(
+            Arc::clone(&players),
+            config.bot_language,
+            config.player_panel_update_interval,
+        );
+        let presence = PresenceService::new(
+            Arc::clone(&players),
+            &config.bot_activity,
+            config.bot_activity_current_track,
+        );
+        let sessions = GuildSessionService::new(Arc::clone(&voice), Arc::clone(&players));
+        let idle_leave = IdleLeaveService::new(
+            Arc::clone(&players),
+            Arc::clone(&sessions),
+            config.idle_leave_timeout,
+        );
+        let player_observer: Arc<dyn PlayerObserver> = CompositePlayerObserver::new(vec![
+            player_panels.clone(),
+            presence.clone(),
+            idle_leave.clone(),
+        ]);
+        if !sessions.initialize_observer(Arc::clone(&player_observer)) {
+            return Err(AppError::Internal {
+                context: "guild session observer was already initialized".to_owned(),
+            });
+        }
         let playback = PlaybackService::new(
             Arc::clone(&track_resolver),
             http_client.clone(),
             Arc::clone(&songbird),
             Arc::clone(&players),
+            player_observer,
         );
-        let sessions = GuildSessionService::new(Arc::clone(&voice), Arc::clone(&players));
         let auto_leave = AutoLeaveService::new(
             Arc::clone(&players),
             Arc::clone(&sessions),
@@ -74,6 +108,9 @@ impl AppState {
             songbird,
             voice,
             playback,
+            player_panels,
+            presence,
+            idle_leave,
             sessions,
             auto_leave,
         }))

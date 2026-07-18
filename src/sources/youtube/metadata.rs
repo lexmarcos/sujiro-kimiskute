@@ -2,7 +2,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
-use crate::{error::AppError, player::track::ResolvedTrack};
+use crate::{error::AppError, player::track::ResolvedTrack, sources::resolver::TrackResolution};
 
 #[derive(Deserialize)]
 struct YoutubeMetadata {
@@ -21,13 +21,20 @@ struct YoutubeMetadata {
     entries: Vec<Option<YoutubeMetadata>>,
 }
 
-pub fn parse_tracks(document: &str) -> Result<Vec<ResolvedTrack>, AppError> {
+pub fn parse_tracks(
+    document: &str,
+    start_at_seconds: Option<u64>,
+) -> Result<TrackResolution, AppError> {
     let metadata = parse_document(document)?;
-    if is_collection(&metadata) {
-        return parse_collection(metadata.entries);
+    if metadata.entries.is_empty() {
+        let track = resolved_track(metadata, start_at_seconds).map_err(invalid_track_error)?;
+        return Ok(TrackResolution {
+            tracks: vec![track],
+            unavailable: 0,
+        });
     }
 
-    Ok(vec![resolved_track(metadata).map_err(invalid_track_error)?])
+    parse_collection(metadata.entries)
 }
 
 pub fn parse_stream_url(document: &str) -> Result<String, AppError> {
@@ -46,41 +53,39 @@ fn parse_document(document: &str) -> Result<YoutubeMetadata, AppError> {
     })
 }
 
-fn is_collection(metadata: &YoutubeMetadata) -> bool {
-    !metadata.entries.is_empty()
-        || matches!(
-            metadata.entry_type.as_deref(),
-            Some("playlist" | "multi_video")
-        )
-}
-
-fn parse_collection(entries: Vec<Option<YoutubeMetadata>>) -> Result<Vec<ResolvedTrack>, AppError> {
+fn parse_collection(entries: Vec<Option<YoutubeMetadata>>) -> Result<TrackResolution, AppError> {
     let entry_count = entries.len();
-    let mut skipped_count = 0_usize;
+    let mut unavailable = 0_usize;
     let mut tracks = Vec::with_capacity(entry_count);
 
     for entry in entries {
         let Some(metadata) = entry else {
-            skipped_count += 1;
+            unavailable += 1;
             continue;
         };
-        match resolved_track(metadata) {
+        match resolved_track(metadata, None) {
             Ok(track) => tracks.push(track),
-            Err(_) => skipped_count += 1,
+            Err(_) => unavailable += 1,
         }
     }
 
-    log_skipped_entries(entry_count, skipped_count);
+    log_skipped_entries(entry_count, unavailable);
     if tracks.is_empty() {
         return Err(AppError::Resolution {
             context: "yt-dlp collection did not contain playable entries".to_owned(),
         });
     }
 
-    Ok(tracks)
+    Ok(TrackResolution {
+        tracks,
+        unavailable,
+    })
 }
 
-fn resolved_track(metadata: YoutubeMetadata) -> Result<ResolvedTrack, &'static str> {
+fn resolved_track(
+    metadata: YoutubeMetadata,
+    start_at_seconds: Option<u64>,
+) -> Result<ResolvedTrack, &'static str> {
     let id = required_value(metadata.id, "track ID")?;
     let title = required_value(metadata.title, "track title")?;
     let webpage_url = required_value(
@@ -96,6 +101,7 @@ fn resolved_track(metadata: YoutubeMetadata) -> Result<ResolvedTrack, &'static s
         title,
         webpage_url,
         duration_seconds: duration_seconds(metadata.duration),
+        start_at_seconds,
         channel_name: optional_value(metadata.channel.or(metadata.uploader)),
         thumbnail_url: optional_value(metadata.thumbnail),
     })

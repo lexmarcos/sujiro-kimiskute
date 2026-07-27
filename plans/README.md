@@ -24,7 +24,7 @@ can be verified cleanly until it lands.
 |------|-------|----------|--------|------|------------|--------|
 | 001 | Make `cargo clippy -- -D warnings` pass and enforce it in CI | P1 | S | LOW | — | DONE |
 | 002 | Stop sending a gateway presence update on every player change | P1 | S | LOW | 001 | DONE |
-| 003 | Bound connect time on the shared HTTP client | P2 | S | MED | 001 | TODO |
+| 003 | Bound connect time on the shared HTTP client | P2 | S | MED | 001 | DONE |
 | 004 | Take Discord panel edits off the playback path | P2 | M | MED | 001, 002 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)

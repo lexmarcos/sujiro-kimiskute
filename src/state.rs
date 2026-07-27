@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use songbird::Songbird;
 use tokio::sync::Semaphore;
@@ -22,6 +22,12 @@ use crate::{
     voice::VoiceConnection,
 };
 
+/// Songbird streams track audio through this client, so only the connect phase
+/// may be bounded — a total request timeout would cut every track short. An
+/// unbounded connect leaves a track stuck in `Playing` with no error event, so
+/// the queue would never advance.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
@@ -40,12 +46,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn build(config: Arc<AppConfig>, songbird: Arc<Songbird>) -> Result<Arc<Self>, AppError> {
-        let http_client =
-            reqwest::Client::builder()
-                .build()
-                .map_err(|source| AppError::Internal {
-                    context: format!("could not build shared HTTP client: {source}"),
-                })?;
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|source| AppError::Internal {
+                context: format!("could not build shared HTTP client: {source}"),
+            })?;
         let players = Arc::new(PlayerManager::new(config.max_queue_size)?);
         let resolution_slots = Arc::new(Semaphore::new(config.max_concurrent_resolutions));
         let youtube_process = Arc::new(YoutubeProcess::new(

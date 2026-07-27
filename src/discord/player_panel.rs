@@ -56,6 +56,14 @@ struct ActivePanel {
     refresh_abort: Option<AbortHandle>,
 }
 
+/// Tracks whether a guild already has a refresh task running, and whether more
+/// changes arrived while it was running.
+#[derive(Default)]
+struct RefreshRequest {
+    in_flight: bool,
+    dirty: bool,
+}
+
 pub struct PlayerPanelService {
     weak_self: Weak<PlayerPanelService>,
     http: OnceCell<Arc<Http>>,
@@ -63,6 +71,7 @@ pub struct PlayerPanelService {
     language: BotLanguage,
     update_interval: Option<Duration>,
     panels: Mutex<HashMap<GuildId, ActivePanel>>,
+    refresh_requests: Mutex<HashMap<GuildId, RefreshRequest>>,
 }
 
 impl PlayerPanelService {
@@ -78,6 +87,7 @@ impl PlayerPanelService {
             language,
             update_interval,
             panels: Mutex::new(HashMap::new()),
+            refresh_requests: Mutex::new(HashMap::new()),
         })
     }
 
@@ -144,6 +154,16 @@ impl PlayerPanelService {
             })
     }
 
+    async fn panel_is_current(&self, guild_id: GuildId, panel: &ActivePanel) -> bool {
+        self.interaction_is_active(
+            guild_id,
+            panel.channel_id,
+            panel.message_id,
+            panel.generation,
+        )
+        .await
+    }
+
     pub async fn refresh(&self, guild_id: GuildId) {
         let Some((panel, displaced_refresh)) = self.begin_refresh(guild_id).await else {
             return;
@@ -180,12 +200,59 @@ impl PlayerPanelService {
             self.remove_if_same(guild_id, panel).await;
             return;
         }
+        // The edit is awaited, so `register` may have displaced this panel and
+        // already stripped its controls meanwhile. The edit just restored them,
+        // which would leave an interactive-looking panel whose buttons all fail
+        // the generation check, so strip them again.
+        if !self.panel_is_current(guild_id, &panel).await {
+            self.disable(&panel).await;
+            return;
+        }
         if snapshot.playback_state == PlaybackState::Playing
             && snapshot.current.is_some()
             && self.update_interval.is_some()
         {
             self.start_refresh_task(guild_id, panel.generation, panel.refresh_revision)
                 .await;
+        }
+    }
+
+    /// Playback notifies observers inline, so the panel's Discord edit must not
+    /// be awaited on that path. At most one refresh task runs per guild; changes
+    /// arriving while it runs collapse into a single follow-up refresh.
+    async fn request_refresh(&self, guild_id: GuildId) {
+        {
+            let mut requests = self.refresh_requests.lock().await;
+            let request = requests.entry(guild_id).or_default();
+            if request.in_flight {
+                request.dirty = true;
+                return;
+            }
+            request.in_flight = true;
+        }
+
+        let Some(service) = self.weak_self.upgrade() else {
+            self.refresh_requests.lock().await.remove(&guild_id);
+            return;
+        };
+        drop(tokio::spawn(async move {
+            service.run_coalesced_refresh(guild_id).await;
+        }));
+    }
+
+    async fn run_coalesced_refresh(self: Arc<Self>, guild_id: GuildId) {
+        loop {
+            self.refresh(guild_id).await;
+
+            let mut requests = self.refresh_requests.lock().await;
+            let Some(request) = requests.get_mut(&guild_id) else {
+                return;
+            };
+            if !request.dirty {
+                requests.remove(&guild_id);
+                return;
+            }
+            request.dirty = false;
         }
     }
 
@@ -264,6 +331,12 @@ impl PlayerPanelService {
                 "failed to refresh player progress"
             );
             self.remove_if_same(guild_id, panel).await;
+            return RefreshLoopControl::Stop;
+        }
+        // `register` aborts this loop, but only cancels an edit still in flight;
+        // one that already landed restored the controls on a displaced panel.
+        if !self.panel_is_current(guild_id, &panel).await {
+            self.disable(&panel).await;
             return RefreshLoopControl::Stop;
         }
         RefreshLoopControl::Continue
@@ -356,7 +429,7 @@ fn abort_refresh(abort_handle: Option<AbortHandle>) {
 #[async_trait]
 impl PlayerObserver for PlayerPanelService {
     async fn player_changed(&self, guild_id: GuildId) {
-        self.refresh(guild_id).await;
+        self.request_refresh(guild_id).await;
     }
 
     async fn track_failed(&self, guild_id: GuildId, track: &QueuedTrack) {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serenity::{
-    all::{Context, EventHandler, GuildId, Interaction, Ready, VoiceState},
+    all::{ComponentInteraction, Context, EventHandler, GuildId, Interaction, Ready, VoiceState},
     async_trait,
 };
 use tokio::sync::OnceCell;
@@ -41,6 +41,15 @@ impl DiscordEventHandler {
             );
         }
     }
+
+    /// `play_requests::dispatch` reports whether it owned the interaction, so
+    /// player controls must only run for component IDs it did not recognise.
+    async fn dispatch_component(&self, context: &Context, component: &ComponentInteraction) {
+        if play_requests::dispatch(context, component, &self.state).await {
+            return;
+        }
+        player_controls::dispatch(context, component, &self.state).await;
+    }
 }
 
 #[async_trait]
@@ -64,9 +73,7 @@ impl EventHandler for DiscordEventHandler {
                 commands::dispatch(&context, &command, &self.state).await;
             }
             Interaction::Component(component) => {
-                if !play_requests::dispatch(&context, &component, &self.state).await {
-                    player_controls::dispatch(&context, &component, &self.state).await;
-                }
+                self.dispatch_component(&context, &component).await;
             }
             _ => {}
         }

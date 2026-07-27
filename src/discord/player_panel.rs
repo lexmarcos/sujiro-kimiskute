@@ -154,6 +154,16 @@ impl PlayerPanelService {
             })
     }
 
+    async fn panel_is_current(&self, guild_id: GuildId, panel: &ActivePanel) -> bool {
+        self.interaction_is_active(
+            guild_id,
+            panel.channel_id,
+            panel.message_id,
+            panel.generation,
+        )
+        .await
+    }
+
     pub async fn refresh(&self, guild_id: GuildId) {
         let Some((panel, displaced_refresh)) = self.begin_refresh(guild_id).await else {
             return;
@@ -188,6 +198,14 @@ impl PlayerPanelService {
                 "failed to refresh active player panel"
             );
             self.remove_if_same(guild_id, panel).await;
+            return;
+        }
+        // The edit is awaited, so `register` may have displaced this panel and
+        // already stripped its controls meanwhile. The edit just restored them,
+        // which would leave an interactive-looking panel whose buttons all fail
+        // the generation check, so strip them again.
+        if !self.panel_is_current(guild_id, &panel).await {
+            self.disable(&panel).await;
             return;
         }
         if snapshot.playback_state == PlaybackState::Playing

@@ -333,6 +333,12 @@ impl PlayerPanelService {
             self.remove_if_same(guild_id, panel).await;
             return RefreshLoopControl::Stop;
         }
+        // `register` aborts this loop, but only cancels an edit still in flight;
+        // one that already landed restored the controls on a displaced panel.
+        if !self.panel_is_current(guild_id, &panel).await {
+            self.disable(&panel).await;
+            return RefreshLoopControl::Stop;
+        }
         RefreshLoopControl::Continue
     }
 

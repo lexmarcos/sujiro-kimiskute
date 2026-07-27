@@ -120,6 +120,19 @@ impl GuildPlayer {
         self.inner.lock().await.playback_state
     }
 
+    /// Presence refresh needs only the playing title; `snapshot` additionally
+    /// clones the queue and round-trips to the audio driver for the position.
+    pub async fn playing_title(&self) -> Option<String> {
+        let state = self.inner.lock().await;
+        if state.playback_state != PlaybackState::Playing {
+            return None;
+        }
+        state
+            .current
+            .as_ref()
+            .map(|current| current.track.track.title.clone())
+    }
+
     pub async fn snapshot(&self) -> GuildPlayerSnapshot {
         let (mut snapshot, handle) = {
             let state = self.inner.lock().await;

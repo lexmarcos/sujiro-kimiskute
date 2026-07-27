@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serenity::{all::ActivityData, gateway::ShardMessenger};
@@ -6,10 +6,7 @@ use tokio::sync::OnceCell;
 
 use crate::{
     config::{BotActivityConfig, BotActivityType},
-    player::{
-        manager::PlayerManager, observer::PlayerObserver, playback_state::PlaybackState,
-        track::QueuedTrack,
-    },
+    player::{manager::PlayerManager, observer::PlayerObserver, track::QueuedTrack},
 };
 
 pub struct PresenceService {
@@ -17,6 +14,7 @@ pub struct PresenceService {
     players: Arc<PlayerManager>,
     configured_activity: ActivityData,
     current_track_enabled: bool,
+    last_activity: Mutex<Option<ActivityData>>,
 }
 
 impl PresenceService {
@@ -30,11 +28,15 @@ impl PresenceService {
             players,
             configured_activity: activity_data(configuration),
             current_track_enabled,
+            last_activity: Mutex::new(None),
         })
     }
 
     pub fn initialize(&self, shard: ShardMessenger) {
         let _ = self.shard.set(shard);
+        // A new gateway session starts with no activity, so the cache must not
+        // suppress the first update after `ready`.
+        self.clear_last_activity();
         self.set_configured();
     }
 
@@ -43,37 +45,58 @@ impl PresenceService {
             self.set_configured();
             return;
         }
-        let players = self.players.all().await;
+        self.set_activity(self.current_track_activity().await);
+    }
+
+    /// Falls back to the configured activity unless exactly one guild is
+    /// playing, because a single presence cannot represent several tracks.
+    async fn current_track_activity(&self) -> ActivityData {
         let mut active_title = None;
-        for player in players {
-            let snapshot = player.snapshot().await;
-            if snapshot.playback_state != PlaybackState::Playing {
-                continue;
-            }
-            let Some(current) = snapshot.current else {
+        for player in self.players.all().await {
+            let Some(title) = player.playing_title().await else {
                 continue;
             };
             if active_title.is_some() {
-                self.set_configured();
-                return;
+                return self.configured_activity.clone();
             }
-            active_title = Some(current.track.title);
+            active_title = Some(title);
         }
 
-        let activity = active_title
+        active_title
             .map(|title| ActivityData::listening(truncate_presence(&title)))
-            .unwrap_or_else(|| self.configured_activity.clone());
-        self.set_activity(activity);
+            .unwrap_or_else(|| self.configured_activity.clone())
     }
 
     fn set_configured(&self) {
         self.set_activity(self.configured_activity.clone());
     }
 
+    // Serenity sends a gateway presence update for every `set_activity` call and
+    // Discord allows only 5 per 20 seconds per session, so identical activities
+    // must not reach the shard.
     fn set_activity(&self, activity: ActivityData) {
-        if let Some(shard) = self.shard.get() {
-            shard.set_activity(Some(activity));
+        let Some(shard) = self.shard.get() else {
+            return;
+        };
+        {
+            let mut last_activity = match self.last_activity.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if last_activity.as_ref() == Some(&activity) {
+                return;
+            }
+            *last_activity = Some(activity.clone());
         }
+        shard.set_activity(Some(activity));
+    }
+
+    fn clear_last_activity(&self) {
+        let mut last_activity = match self.last_activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_activity = None;
     }
 }
 

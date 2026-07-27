@@ -11,6 +11,10 @@ INSTALL_DIR="${SUJIRO_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
 BIN_DIR="${SUJIRO_BIN_DIR:-${DEFAULT_BIN_DIR}}"
 TEMP_DIR=""
 ROLLBACK_ACTIVE="false"
+INSTALLATION_MODE="install"
+PREVIOUS_VERSION=""
+declare -a ENV_TEMPLATE_KEYS=()
+declare -A ENV_TEMPLATE_LINES=()
 print_step() {
     printf '\n\033[1;34m==>\033[0m %s\n' "$1"
 }
@@ -43,11 +47,16 @@ finish_installation() {
         restore_destination "${BOT_DESTINATION}" bot || rollback_failed="true"
         restore_destination "${ENV_DESTINATION}" env || rollback_failed="true"
         restore_destination "${LAUNCHER_DESTINATION}" launcher || rollback_failed="true"
+        restore_destination "${VERSION_DESTINATION}" version || rollback_failed="true"
         [[ -z "${YT_DLP_CANDIDATE:-}" ]] \
             || restore_destination "${YT_DLP_PATH}" yt-dlp || rollback_failed="true"
         print_warning "The previous installation was restored after an error."
     fi
-    for staged_file in "${BOT_DESTINATION:-}" "${ENV_DESTINATION:-}" "${LAUNCHER_DESTINATION:-}"; do
+    for staged_file in \
+        "${BOT_DESTINATION:-}" \
+        "${ENV_DESTINATION:-}" \
+        "${LAUNCHER_DESTINATION:-}" \
+        "${VERSION_DESTINATION:-}"; do
         [[ -z "${staged_file}" ]] || rm -f -- "${staged_file}.new" || true
     done
     [[ -z "${YT_DLP_CANDIDATE:-}" || -z "${YT_DLP_PATH:-}" ]] \
@@ -59,7 +68,7 @@ finish_installation() {
 trap finish_installation EXIT
 require_commands() {
     local command_name
-    for command_name in curl tar sha256sum mktemp install uname sed awk grep head mv chmod mkdir dirname basename env timeout cp; do
+    for command_name in curl tar sha256sum mktemp install uname sed awk grep head tail mv chmod mkdir dirname basename env timeout cp wc; do
         command -v "${command_name}" >/dev/null 2>&1 || {
             fail_installation "Required command not found: ${command_name}"
         }
@@ -127,6 +136,44 @@ resolve_release_tag() {
         fail_installation "Invalid or unavailable release tag: ${tag:-empty}"
     }
     RELEASE_TAG="${tag}"
+}
+
+download_environment_template() {
+    local template_size
+    ENV_TEMPLATE="${TEMP_DIR}/.env.example"
+
+    print_step "Downloading configuration template for ${RELEASE_TAG}"
+    download_file \
+        "https://raw.githubusercontent.com/${REPOSITORY}/${RELEASE_TAG}/.env.example" \
+        "${ENV_TEMPLATE}"
+    template_size="$(wc -c <"${ENV_TEMPLATE}")"
+    ((template_size > 0 && template_size <= 65536)) || {
+        fail_installation "The ${RELEASE_TAG} configuration template has an invalid size."
+    }
+    load_environment_template
+    print_success "Configuration template for ${RELEASE_TAG} downloaded"
+}
+
+load_environment_template() {
+    local line key
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        if [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
+            key="${BASH_REMATCH[2]}"
+            [[ -z "${ENV_TEMPLATE_LINES[${key}]+present}" ]] || {
+                fail_installation "The ${RELEASE_TAG} configuration template repeats key ${key}."
+            }
+            ENV_TEMPLATE_KEYS+=("${key}")
+            ENV_TEMPLATE_LINES["${key}"]="${line}"
+            continue
+        fi
+        [[ "${line}" =~ ^[[:space:]]*$ || "${line}" =~ ^[[:space:]]*# ]] || {
+            fail_installation "The ${RELEASE_TAG} configuration template contains an unsupported line."
+        }
+    done <"${ENV_TEMPLATE}"
+    ((${#ENV_TEMPLATE_KEYS[@]} > 0)) || {
+        fail_installation "The ${RELEASE_TAG} configuration template contains no settings."
+    }
 }
 
 expected_checksum() {
@@ -324,11 +371,14 @@ prompt_yes_no() {
     done
 }
 
+require_interactive_terminal() {
+    (: <>/dev/tty) 2>/dev/null || {
+        fail_installation "An interactive terminal is required to configure the bot securely."
+    }
+}
+
 collect_configuration() {
-    if [[ -f "${ENV_DESTINATION}" ]] \
-        && ! prompt_yes_no "An existing .env will be replaced. Continue?"; then
-        fail_installation "Installation cancelled; the existing configuration was not changed."
-    fi
+    require_interactive_terminal
     print_step "Discord configuration"
     printf 'Create the bot at https://discord.com/developers/applications\n'
     DISCORD_TOKEN="$(prompt_required_secret "Discord bot token")"
@@ -350,8 +400,6 @@ collect_configuration() {
 
     if prompt_yes_no "Configure advanced settings?"; then
         YT_DLP_EXTRA_ARGS="$(prompt_secret "Extra yt-dlp arguments (optional)")"
-        bash -n -c "set -- ${YT_DLP_EXTRA_ARGS}" >/dev/null 2>&1 \
-            || fail_installation "Extra yt-dlp arguments contain unmatched shell syntax."
         YT_DLP_TIMEOUT_SECONDS="$(prompt_positive_integer \
             "yt-dlp timeout in seconds" "${YT_DLP_TIMEOUT_SECONDS}")"
         AUTO_LEAVE_SECONDS="$(prompt_positive_integer \
@@ -393,10 +441,13 @@ write_configuration_file() {
     write_env_entry BOT_LANGUAGE "${BOT_LANGUAGE}"
     write_env_entry BOT_ACTIVITY_TYPE "${BOT_ACTIVITY_TYPE}"
     write_env_entry BOT_ACTIVITY_MESSAGE "${BOT_ACTIVITY_MESSAGE}"
+    write_env_entry BOT_ACTIVITY_CURRENT_TRACK "false"
     write_env_entry YT_DLP_PATH "${YT_DLP_PATH}"
     write_env_entry YT_DLP_EXTRA_ARGS "${YT_DLP_EXTRA_ARGS}"
     write_env_entry YT_DLP_TIMEOUT_SECONDS "${YT_DLP_TIMEOUT_SECONDS}"
     write_env_entry AUTO_LEAVE_SECONDS "${AUTO_LEAVE_SECONDS}"
+    write_env_entry IDLE_LEAVE_SECONDS "300"
+    write_env_entry PLAYER_PANEL_UPDATE_SECONDS "5"
     write_env_entry MAX_QUEUE_SIZE "${MAX_QUEUE_SIZE}"
     write_env_entry MAX_CONCURRENT_RESOLUTIONS "${MAX_CONCURRENT_RESOLUTIONS}"
     write_env_entry RUST_LOG "${RUST_LOG}"
@@ -415,8 +466,130 @@ prepare_installation_destinations() {
     BOT_DESTINATION="${INSTALL_DIR}/bin/sujiro-kimiskute"
     ENV_DESTINATION="${INSTALL_DIR}/.env"
     LAUNCHER_DESTINATION="${BIN_DIR}/sujiro-kimiskute"
+    VERSION_DESTINATION="${INSTALL_DIR}/.install-version"
     [[ "${BOT_DESTINATION}" != "${LAUNCHER_DESTINATION}" ]] \
         || fail_installation "The launcher and application binary cannot use the same path."
+}
+
+detect_installation_state() {
+    local destination
+    for destination in \
+        "${BOT_DESTINATION}" \
+        "${ENV_DESTINATION}" \
+        "${LAUNCHER_DESTINATION}" \
+        "${VERSION_DESTINATION}"; do
+        if [[ -e "${destination}" || -L "${destination}" ]]; then
+            INSTALLATION_MODE="upgrade"
+            break
+        fi
+    done
+    [[ "${INSTALLATION_MODE}" == "upgrade" ]] || return 0
+
+    if [[ ! -e "${VERSION_DESTINATION}" && ! -L "${VERSION_DESTINATION}" ]]; then
+        print_warning "Existing installation has no version metadata; the previous version is unknown."
+        return
+    fi
+    [[ -f "${VERSION_DESTINATION}" && ! -L "${VERSION_DESTINATION}" ]] || {
+        print_warning "Existing version metadata is not a regular file; the previous version is unknown."
+        return
+    }
+    PREVIOUS_VERSION="$(<"${VERSION_DESTINATION}")"
+    if [[ ! "${PREVIOUS_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+        print_warning "Existing version metadata is invalid; the previous version is unknown."
+        PREVIOUS_VERSION=""
+    fi
+}
+
+collect_present_environment_keys() {
+    local environment_file="$1" line key
+    declare -gA PRESENT_ENV_KEYS=()
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        if [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
+            key="${BASH_REMATCH[2]}"
+            PRESENT_ENV_KEYS["${key}"]="present"
+        fi
+    done <"${environment_file}"
+}
+
+prompt_missing_environment_value() {
+    local key="$1" template_line="$2" response
+    case "${key}" in
+        DISCORD_TOKEN)
+            response="$(prompt_required_secret "Discord bot token (${key})")"
+            write_env_entry "${key}" "${response}"
+            ;;
+        DISCORD_APPLICATION_ID)
+            response="$(prompt_positive_integer "Discord Application ID (${key})" "")"
+            write_env_entry "${key}" "${response}"
+            ;;
+        YT_DLP_PATH)
+            response="$(prompt_text "${key}" "${YT_DLP_PATH}")"
+            write_env_entry "${key}" "${response}"
+            ;;
+        *TOKEN* | *SECRET* | *PASSWORD* | *PRIVATE_KEY* | *COOKIE*)
+            response="$(prompt_secret "${key} (Enter uses the release default)")"
+            if [[ -n "${response}" ]]; then
+                write_env_entry "${key}" "${response}"
+            else
+                printf '%s\n' "${template_line}" >>"${CONFIG_CANDIDATE}"
+            fi
+            ;;
+        *)
+            response="$(prompt_text "${key} (Enter uses the release default)" "")"
+            if [[ -n "${response}" ]]; then
+                write_env_entry "${key}" "${response}"
+            else
+                printf '%s\n' "${template_line}" >>"${CONFIG_CANDIDATE}"
+            fi
+            ;;
+    esac
+}
+
+append_missing_environment_keys() {
+    local key last_byte missing_count=0
+    collect_present_environment_keys "${CONFIG_CANDIDATE}"
+    for key in "${ENV_TEMPLATE_KEYS[@]}"; do
+        [[ -n "${PRESENT_ENV_KEYS[${key}]+present}" ]] || ((missing_count += 1))
+    done
+    if ((missing_count == 0)); then
+        print_success "Existing configuration already contains every ${RELEASE_TAG} setting"
+        return
+    fi
+
+    require_interactive_terminal
+    print_step "Configuring ${missing_count} new setting(s) from ${RELEASE_TAG}"
+    if [[ -s "${CONFIG_CANDIDATE}" ]]; then
+        last_byte="$(tail -c 1 -- "${CONFIG_CANDIDATE}")"
+        [[ -z "${last_byte}" ]] || printf '\n' >>"${CONFIG_CANDIDATE}"
+    fi
+    printf '\n# Added while upgrading to %s\n' "${RELEASE_TAG}" >>"${CONFIG_CANDIDATE}"
+    for key in "${ENV_TEMPLATE_KEYS[@]}"; do
+        [[ -z "${PRESENT_ENV_KEYS[${key}]+present}" ]] || continue
+        prompt_missing_environment_value "${key}" "${ENV_TEMPLATE_LINES[${key}]}"
+    done
+}
+
+prepare_configuration() {
+    if [[ "${INSTALLATION_MODE}" == "install" ]]; then
+        collect_configuration
+        append_missing_environment_keys
+        return
+    fi
+
+    CONFIG_CANDIDATE="${TEMP_DIR}/sujiro.env"
+    if [[ -e "${ENV_DESTINATION}" || -L "${ENV_DESTINATION}" ]]; then
+        [[ -f "${ENV_DESTINATION}" && ! -L "${ENV_DESTINATION}" ]] || {
+            fail_installation "Refusing to read non-regular configuration: ${ENV_DESTINATION}"
+        }
+        cp -a -- "${ENV_DESTINATION}" "${CONFIG_CANDIDATE}"
+        chmod 0600 "${CONFIG_CANDIDATE}"
+    else
+        : >"${CONFIG_CANDIDATE}"
+        chmod 0600 "${CONFIG_CANDIDATE}"
+        print_warning "Existing installation has no .env; all release settings must be configured."
+    fi
+    append_missing_environment_keys
 }
 
 backup_destination() {
@@ -431,8 +604,13 @@ backup_destination() {
 
 install_verified_files() {
     local launcher_candidate="${TEMP_DIR}/sujiro-launcher"
+    local version_candidate="${TEMP_DIR}/install-version"
     print_step "Installing verified files"
-    rm -f -- "${BOT_DESTINATION}.new" "${ENV_DESTINATION}.new" "${LAUNCHER_DESTINATION}.new"
+    rm -f -- \
+        "${BOT_DESTINATION}.new" \
+        "${ENV_DESTINATION}.new" \
+        "${LAUNCHER_DESTINATION}.new" \
+        "${VERSION_DESTINATION}.new"
     [[ -z "${YT_DLP_CANDIDATE:-}" ]] || rm -f -- "${YT_DLP_PATH}.new"
     install -m 0755 "${BOT_CANDIDATE}" "${BOT_DESTINATION}.new"
     if [[ -n "${YT_DLP_CANDIDATE:-}" ]]; then
@@ -442,16 +620,20 @@ install_verified_files() {
     printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ncd -- %q\nexec %q "$@"\n' \
         "${INSTALL_DIR}" "${BOT_DESTINATION}" >"${launcher_candidate}"
     install -m 0755 "${launcher_candidate}" "${LAUNCHER_DESTINATION}.new"
+    printf '%s\n' "${RELEASE_TAG}" >"${version_candidate}"
+    install -m 0600 "${version_candidate}" "${VERSION_DESTINATION}.new"
 
     backup_destination "${BOT_DESTINATION}" bot
     backup_destination "${ENV_DESTINATION}" env
     backup_destination "${LAUNCHER_DESTINATION}" launcher
+    backup_destination "${VERSION_DESTINATION}" version
     [[ -z "${YT_DLP_CANDIDATE:-}" ]] || backup_destination "${YT_DLP_PATH}" yt-dlp
     ROLLBACK_ACTIVE="true"
     mv -f -- "${BOT_DESTINATION}.new" "${BOT_DESTINATION}"
     [[ -z "${YT_DLP_CANDIDATE:-}" ]] || mv -f -- "${YT_DLP_PATH}.new" "${YT_DLP_PATH}"
     mv -f -- "${ENV_DESTINATION}.new" "${ENV_DESTINATION}"
     mv -f -- "${LAUNCHER_DESTINATION}.new" "${LAUNCHER_DESTINATION}"
+    mv -f -- "${VERSION_DESTINATION}.new" "${VERSION_DESTINATION}"
     ROLLBACK_ACTIVE="false"
     LAUNCHER_PATH="${LAUNCHER_DESTINATION}"
     print_success "Installed Sujiro Kimiskute ${RELEASE_TAG}"
@@ -459,14 +641,19 @@ install_verified_files() {
 
 print_completion() {
     local invite_url
-    invite_url="https://discord.com/oauth2/authorize?client_id=${DISCORD_APPLICATION_ID}&permissions=3148800&scope=bot%20applications.commands"
-    printf '\nInstallation complete.\n'
-    printf '  Version:       %s\n' "${RELEASE_TAG}"
+    if [[ "${INSTALLATION_MODE}" == "upgrade" ]]; then
+        printf '\nUpgrade complete.\n'
+        printf '  Version:       %s -> %s\n' "${PREVIOUS_VERSION:-unknown (legacy installation)}" "${RELEASE_TAG}"
+    else
+        invite_url="https://discord.com/oauth2/authorize?client_id=${DISCORD_APPLICATION_ID}&permissions=3148800&scope=bot%20applications.commands"
+        printf '\nInstallation complete.\n'
+        printf '  Version:       %s\n' "${RELEASE_TAG}"
+    fi
     printf '  Platform:      %s\n' "${BOT_PLATFORM}"
     printf '  Installation:  %s\n' "${INSTALL_DIR}"
     printf '  Configuration: %s/.env\n' "${INSTALL_DIR}"
     printf '  yt-dlp:        %s\n' "${YT_DLP_PATH}"
-    printf '  Invite bot:    %s\n' "${invite_url}"
+    [[ "${INSTALLATION_MODE}" == "upgrade" ]] || printf '  Invite bot:    %s\n' "${invite_url}"
     printf '\nStart the bot with:\n  %s\n' "${LAUNCHER_PATH}"
 
     case ":${PATH}:" in
@@ -481,17 +668,16 @@ main() {
         exit 0
     fi
     validate_installation_paths
-    [[ -r /dev/tty && -w /dev/tty ]] || {
-        fail_installation "An interactive terminal is required to configure the bot securely."
-    }
     require_commands
     TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sujiro-install.XXXXXXXX")"
     detect_platform
     resolve_release_tag
     download_bot_release
+    download_environment_template
     find_or_download_yt_dlp
     prepare_installation_destinations
-    collect_configuration
+    detect_installation_state
+    prepare_configuration
     install_verified_files
     print_completion
 }

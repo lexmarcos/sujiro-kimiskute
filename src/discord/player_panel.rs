@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serenity::{
     all::{ButtonStyle, ChannelId, Colour, GuildId, MessageId, ReactionType},
     builder::{CreateActionRow, CreateButton, CreateEmbed, EditMessage},
-    http::Http,
+    http::{Http, HttpError},
 };
 use tokio::{
     sync::{Mutex, OnceCell},
@@ -64,6 +64,12 @@ struct RefreshRequest {
     dirty: bool,
 }
 
+enum PanelRegistration {
+    /// A newer message already owns the guild's panel, so this one keeps its own body.
+    Superseded,
+    Installed(Option<ActivePanel>),
+}
+
 pub struct PlayerPanelService {
     weak_self: Weak<PlayerPanelService>,
     http: OnceCell<Arc<Http>>,
@@ -102,30 +108,52 @@ impl PlayerPanelService {
         message_id: MessageId,
         view: PanelView,
     ) {
-        let previous = {
-            let mut panels = self.panels.lock().await;
-            let generation = panels
-                .get(&guild_id)
-                .map_or(1, |panel| panel.generation.wrapping_add(1));
-            panels.insert(
-                guild_id,
-                ActivePanel {
-                    channel_id,
-                    message_id,
-                    view,
-                    generation,
-                    refresh_revision: 0,
-                    refresh_abort: None,
-                },
-            )
+        let PanelRegistration::Installed(previous) = self
+            .install_panel(guild_id, channel_id, message_id, view)
+            .await
+        else {
+            return;
         };
         if let Some(mut previous) = previous {
             abort_refresh(previous.refresh_abort.take());
             if previous.channel_id != channel_id || previous.message_id != message_id {
-                self.disable(&previous).await;
+                self.finalize(&previous, replaced_panel_message(self.language))
+                    .await;
             }
         }
         self.refresh(guild_id).await;
+    }
+
+    /// Concurrent play requests answer in their own tasks, so registrations can
+    /// arrive out of order. The newest message has to stay the live panel, or the
+    /// channel ends up with a dead-looking reply below a still-updating one.
+    async fn install_panel(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        view: PanelView,
+    ) -> PanelRegistration {
+        let mut panels = self.panels.lock().await;
+        let current = panels.get(&guild_id);
+        if current.is_some_and(|panel| {
+            panel.channel_id == channel_id && panel.message_id.get() > message_id.get()
+        }) {
+            return PanelRegistration::Superseded;
+        }
+
+        let generation = current.map_or(1, |panel| panel.generation.wrapping_add(1));
+        PanelRegistration::Installed(panels.insert(
+            guild_id,
+            ActivePanel {
+                channel_id,
+                message_id,
+                view,
+                generation,
+                refresh_revision: 0,
+                refresh_abort: None,
+            },
+        ))
     }
 
     pub async fn channel_id(&self, guild_id: GuildId) -> Option<ChannelId> {
@@ -173,7 +201,8 @@ impl PlayerPanelService {
             return;
         };
         let Some(player) = self.players.get(guild_id).await else {
-            self.disable(&panel).await;
+            self.finalize(&panel, idle_panel_message(self.language))
+                .await;
             self.remove_if_same(guild_id, panel).await;
             return;
         };
@@ -197,15 +226,18 @@ impl PlayerPanelService {
                 error = %source,
                 "failed to refresh active player panel"
             );
-            self.remove_if_same(guild_id, panel).await;
-            return;
+            if panel_is_unreachable(&source) {
+                self.remove_if_same(guild_id, panel).await;
+                return;
+            }
         }
         // The edit is awaited, so `register` may have displaced this panel and
-        // already stripped its controls meanwhile. The edit just restored them,
+        // already retired it meanwhile. The edit just restored its live body,
         // which would leave an interactive-looking panel whose buttons all fail
-        // the generation check, so strip them again.
+        // the generation check, so retire it again.
         if !self.panel_is_current(guild_id, &panel).await {
-            self.disable(&panel).await;
+            self.finalize(&panel, replaced_panel_message(self.language))
+                .await;
             return;
         }
         if snapshot.playback_state == PlaybackState::Playing
@@ -330,36 +362,45 @@ impl PlayerPanelService {
                 error = %source,
                 "failed to refresh player progress"
             );
-            self.remove_if_same(guild_id, panel).await;
-            return RefreshLoopControl::Stop;
+            if panel_is_unreachable(&source) {
+                self.remove_if_same(guild_id, panel).await;
+                return RefreshLoopControl::Stop;
+            }
+            // A transient failure would otherwise freeze the panel on the position
+            // it last managed to render, so the next tick tries again.
+            return RefreshLoopControl::Continue;
         }
         // `register` aborts this loop, but only cancels an edit still in flight;
-        // one that already landed restored the controls on a displaced panel.
+        // one that already landed restored the live body of a displaced panel.
         if !self.panel_is_current(guild_id, &panel).await {
-            self.disable(&panel).await;
+            self.finalize(&panel, replaced_panel_message(self.language))
+                .await;
             return RefreshLoopControl::Stop;
         }
         RefreshLoopControl::Continue
     }
 
-    async fn disable(&self, panel: &ActivePanel) {
+    /// Retires a panel for good. Its embed carries Discord relative timestamps,
+    /// which keep counting long after the track they described stopped, so the
+    /// whole body is replaced instead of only dropping the controls.
+    async fn finalize(&self, panel: &ActivePanel, notice: &'static str) {
         let Some(http) = self.http.get() else {
             return;
         };
+        let builder = EditMessage::new()
+            .content(notice)
+            .embeds(Vec::new())
+            .components(Vec::new());
         if let Err(source) = panel
             .channel_id
-            .edit_message(
-                http,
-                panel.message_id,
-                EditMessage::new().components(Vec::new()),
-            )
+            .edit_message(http, panel.message_id, builder)
             .await
         {
             warn!(
                 channel_id = %panel.channel_id,
                 message_id = %panel.message_id,
                 error = %source,
-                "failed to disable stale player panel"
+                "failed to retire stale player panel"
             );
         }
     }
@@ -418,6 +459,16 @@ fn panel_snapshot(panel: &ActivePanel) -> ActivePanel {
         refresh_revision: panel.refresh_revision,
         refresh_abort: None,
     }
+}
+
+/// Edits also fail for reasons that pass, such as timeouts and Discord outages.
+/// Forgetting the panel then would strand it mid-track, so only a message the bot
+/// can no longer edit is worth dropping.
+fn panel_is_unreachable(error: &serenity::Error) -> bool {
+    let serenity::Error::Http(HttpError::UnsuccessfulRequest(response)) = error else {
+        return false;
+    };
+    matches!(response.status_code.as_u16(), 403 | 404)
 }
 
 fn abort_refresh(abort_handle: Option<AbortHandle>) {
@@ -850,6 +901,13 @@ fn idle_panel_message(language: BotLanguage) -> &'static str {
     match language {
         BotLanguage::PtBr => "🎵 A reprodução terminou. Use `/play` para adicionar uma música.",
         BotLanguage::EnUs => "🎵 Playback finished. Use `/play` to add a track.",
+    }
+}
+
+fn replaced_panel_message(language: BotLanguage) -> &'static str {
+    match language {
+        BotLanguage::PtBr => "🎵 Este painel foi substituído por um mais recente.",
+        BotLanguage::EnUs => "🎵 This panel was replaced by a newer one.",
     }
 }
 

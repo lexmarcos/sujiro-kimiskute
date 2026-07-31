@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serenity::{
     all::{ComponentInteraction, Context, GuildId},
-    builder::EditInteractionResponse,
+    builder::CreateInteractionResponseFollowup,
 };
 use tracing::{error, info};
 
@@ -13,19 +13,13 @@ use crate::{
         guild_player::GuildPlayer,
         playback::{PlaybackControlResult, PlaybackPreviousResult, PlaybackSkipResult},
         playback_state::PlaybackState,
-        track::QueuedTrack,
     },
     state::AppState,
 };
 
-use super::{
-    commands::truncate_text,
-    player_panel::{
-        PREVIOUS_CONTROL_ID, SKIP_CONTROL_ID, STOP_CONTROL_ID, TOGGLE_CONTROL_ID, stopped_message,
-    },
+use super::player_panel::{
+    PREVIOUS_CONTROL_ID, SKIP_CONTROL_ID, STOP_CONTROL_ID, TOGGLE_CONTROL_ID,
 };
-
-const MAX_FEEDBACK_TITLE_CHARS: usize = 100;
 
 #[derive(Clone, Copy)]
 enum PlayerControl {
@@ -35,8 +29,9 @@ enum PlayerControl {
     Stop,
 }
 
-struct ControlOutcome {
-    feedback: String,
+enum ControlOutcome {
+    Changed,
+    Unchanged(String),
 }
 
 struct PlayerControlRequest {
@@ -54,20 +49,22 @@ pub async fn dispatch(
     };
     let control = request.control;
     log_received(interaction, control);
-    if let Err(source) = interaction.defer_ephemeral(&context.http).await {
+    if let Err(source) = interaction.defer(&context.http).await {
         log_discord_error(interaction, control, &source, "defer player control");
         return;
     }
 
     let language = state.config.bot_language;
     if !interaction_is_active(interaction, state, request.generation).await {
-        edit_feedback(context, interaction, stale_panel_message(language), control).await;
+        send_feedback(context, interaction, stale_panel_message(language), control).await;
         return;
     }
     let result = run_control(context, interaction, state, control, language).await;
     match result {
         Ok((outcome, _player)) => {
-            edit_feedback(context, interaction, &outcome.feedback, control).await;
+            if let ControlOutcome::Unchanged(feedback) = outcome {
+                send_feedback(context, interaction, &feedback, control).await;
+            }
             info!(
                 guild_id = ?interaction.guild_id,
                 user_id = %interaction.user.id,
@@ -136,7 +133,7 @@ async fn execute_control(
         PlayerControl::Previous => previous(state, player, language).await,
         PlayerControl::Toggle => toggle(state, &player, language).await,
         PlayerControl::Skip => skip(state, player, language).await,
-        PlayerControl::Stop => stop(context, state, guild_id, &player, language).await,
+        PlayerControl::Stop => stop(context, state, guild_id, &player).await,
     }
 }
 
@@ -146,21 +143,17 @@ async fn previous(
     language: BotLanguage,
 ) -> Result<ControlOutcome, AppError> {
     let result = state.playback.previous(player).await?;
-    let feedback = match (language, result) {
+    let outcome = match (language, result) {
         (BotLanguage::PtBr, PlaybackPreviousResult::NoPrevious) => {
-            "⏮️ Não há uma música anterior no histórico.".to_owned()
+            ControlOutcome::Unchanged("⏮️ Não há uma música anterior no histórico.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackPreviousResult::Started { track }) => {
-            format!("⏮️ Voltando para **{}**.", feedback_title(&track))
-        }
+        (BotLanguage::PtBr, PlaybackPreviousResult::Started { .. }) => ControlOutcome::Changed,
         (BotLanguage::EnUs, PlaybackPreviousResult::NoPrevious) => {
-            "⏮️ There is no previous track in the history.".to_owned()
+            ControlOutcome::Unchanged("⏮️ There is no previous track in the history.".to_owned())
         }
-        (BotLanguage::EnUs, PlaybackPreviousResult::Started { track }) => {
-            format!("⏮️ Going back to **{}**.", feedback_title(&track))
-        }
+        (BotLanguage::EnUs, PlaybackPreviousResult::Started { .. }) => ControlOutcome::Changed,
     };
-    Ok(ControlOutcome { feedback })
+    Ok(outcome)
 }
 
 async fn toggle(
@@ -174,9 +167,7 @@ async fn toggle(
     } else {
         state.playback.pause(player).await?
     };
-    Ok(ControlOutcome {
-        feedback: toggle_feedback(result, was_paused, language),
-    })
+    Ok(toggle_outcome(result, language))
 }
 
 async fn skip(
@@ -185,27 +176,23 @@ async fn skip(
     language: BotLanguage,
 ) -> Result<ControlOutcome, AppError> {
     let result = state.playback.skip(player).await?;
-    let feedback = match (language, result) {
+    let outcome = match (language, result) {
         (BotLanguage::PtBr, PlaybackSkipResult::NoTrack) => {
-            "🎵 Nenhuma música está tocando para pular.".to_owned()
+            ControlOutcome::Unchanged("🎵 Nenhuma música está tocando para pular.".to_owned())
         }
         (BotLanguage::PtBr, PlaybackSkipResult::NoNext) => {
-            "⏭️ Não há próxima música na fila.".to_owned()
+            ControlOutcome::Unchanged("⏭️ Não há próxima música na fila.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackSkipResult::Skipped { track }) => {
-            format!("⏭️ **{}** foi pulada.", feedback_title(&track))
-        }
+        (BotLanguage::PtBr, PlaybackSkipResult::Skipped { .. }) => ControlOutcome::Changed,
         (BotLanguage::EnUs, PlaybackSkipResult::NoTrack) => {
-            "🎵 No track is playing to skip.".to_owned()
+            ControlOutcome::Unchanged("🎵 No track is playing to skip.".to_owned())
         }
         (BotLanguage::EnUs, PlaybackSkipResult::NoNext) => {
-            "⏭️ There is no next track in the queue.".to_owned()
+            ControlOutcome::Unchanged("⏭️ There is no next track in the queue.".to_owned())
         }
-        (BotLanguage::EnUs, PlaybackSkipResult::Skipped { track }) => {
-            format!("⏭️ Skipped **{}**.", feedback_title(&track))
-        }
+        (BotLanguage::EnUs, PlaybackSkipResult::Skipped { .. }) => ControlOutcome::Changed,
     };
-    Ok(ControlOutcome { feedback })
+    Ok(outcome)
 }
 
 async fn stop(
@@ -213,16 +200,13 @@ async fn stop(
     state: &AppState,
     guild_id: GuildId,
     player: &GuildPlayer,
-    language: BotLanguage,
 ) -> Result<ControlOutcome, AppError> {
-    let stopped = state.playback.stop(player).await?;
+    state.playback.stop(player).await?;
     state
         .auto_leave
         .refresh(Arc::clone(&context.cache), guild_id)
         .await;
-    Ok(ControlOutcome {
-        feedback: stopped_message(stopped.removed_tracks, language),
-    })
+    Ok(ControlOutcome::Changed)
 }
 
 async fn respond_error(
@@ -239,7 +223,7 @@ async fn respond_error(
         error = %source,
         "player control operation failed"
     );
-    edit_feedback(
+    send_feedback(
         context,
         interaction,
         &source.discord_message(language),
@@ -248,58 +232,46 @@ async fn respond_error(
     .await;
 }
 
-async fn edit_feedback(
+async fn send_feedback(
     context: &Context,
     interaction: &ComponentInteraction,
     feedback: &str,
     control: PlayerControl,
 ) {
-    let builder = EditInteractionResponse::new().content(feedback);
-    if let Err(source) = interaction.edit_response(&context.http, builder).await {
+    let builder = CreateInteractionResponseFollowup::new()
+        .content(feedback)
+        .ephemeral(true);
+    if let Err(source) = interaction.create_followup(&context.http, builder).await {
         log_discord_error(
             interaction,
             control,
             &source,
-            "edit player control response",
+            "send player control feedback",
         );
     }
 }
 
-fn toggle_feedback(
-    result: PlaybackControlResult,
-    was_paused: bool,
-    language: BotLanguage,
-) -> String {
-    match (language, result, was_paused) {
-        (BotLanguage::PtBr, PlaybackControlResult::Changed, true) => {
-            "▶️ Reprodução retomada.".to_owned()
+fn toggle_outcome(result: PlaybackControlResult, language: BotLanguage) -> ControlOutcome {
+    match (language, result) {
+        (BotLanguage::PtBr, PlaybackControlResult::Changed) => ControlOutcome::Changed,
+        (BotLanguage::PtBr, PlaybackControlResult::NoTrack) => {
+            ControlOutcome::Unchanged("🎵 Nenhuma música está tocando agora.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackControlResult::Changed, false) => {
-            "⏸️ Reprodução pausada.".to_owned()
+        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPaused) => {
+            ControlOutcome::Unchanged("⏸️ A reprodução já está pausada.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackControlResult::NoTrack, _) => {
-            "🎵 Nenhuma música está tocando agora.".to_owned()
+        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPlaying) => {
+            ControlOutcome::Unchanged("▶️ A reprodução já está tocando.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPaused, _) => {
-            "⏸️ A reprodução já está pausada.".to_owned()
+        (BotLanguage::EnUs, PlaybackControlResult::Changed) => ControlOutcome::Changed,
+        (BotLanguage::EnUs, PlaybackControlResult::NoTrack) => {
+            ControlOutcome::Unchanged("🎵 No track is playing right now.".to_owned())
         }
-        (BotLanguage::PtBr, PlaybackControlResult::AlreadyPlaying, _) => {
-            "▶️ A reprodução já está tocando.".to_owned()
+        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPaused) => {
+            ControlOutcome::Unchanged("⏸️ Playback is already paused.".to_owned())
         }
-        (BotLanguage::EnUs, PlaybackControlResult::Changed, true) => {
-            "▶️ Playback resumed.".to_owned()
-        }
-        (BotLanguage::EnUs, PlaybackControlResult::Changed, false) => {
-            "⏸️ Playback paused.".to_owned()
-        }
-        (BotLanguage::EnUs, PlaybackControlResult::NoTrack, _) => {
-            "🎵 No track is playing right now.".to_owned()
-        }
-        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPaused, _) => {
-            "⏸️ Playback is already paused.".to_owned()
-        }
-        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPlaying, _) => {
-            "▶️ Playback is already playing.".to_owned()
+        (BotLanguage::EnUs, PlaybackControlResult::AlreadyPlaying) => {
+            ControlOutcome::Unchanged("▶️ Playback is already playing.".to_owned())
         }
     }
 }
@@ -313,10 +285,6 @@ fn stale_panel_message(language: BotLanguage) -> &'static str {
             "This player panel is no longer active. Use the latest panel or `/queue`."
         }
     }
-}
-
-fn feedback_title(track: &QueuedTrack) -> String {
-    truncate_text(&track.track.title, MAX_FEEDBACK_TITLE_CHARS)
 }
 
 fn log_received(interaction: &ComponentInteraction, control: PlayerControl) {

@@ -24,7 +24,9 @@ impl GuildPlayer {
         let idle_leave_abort = state
             .invalidate_idle_leave()
             .and_then(|timer| timer.abort_handle);
-        LeaveClaim::Ready(state.begin_leave(auto_leave_abort, idle_leave_abort))
+        LeaveClaim::Ready(Box::new(
+            state.begin_leave(auto_leave_abort, idle_leave_abort),
+        ))
     }
 
     pub(crate) async fn cancel_auto_leave_for_activity(

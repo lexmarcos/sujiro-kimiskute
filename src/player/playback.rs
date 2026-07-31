@@ -5,7 +5,7 @@ use songbird::{
     Songbird,
     events::{Event, EventData, TrackEvent},
     input::HttpRequest,
-    tracks::{Track, TrackHandle},
+    tracks::{ControlError, Track, TrackHandle},
 };
 use tracing::{info, warn};
 
@@ -22,11 +22,15 @@ use crate::{
         queue::QueueInsertionReceipt,
         track::QueuedTrack,
     },
-    sources::TrackResolver,
+    sources::{
+        TrackResolver,
+        resolver::{PreparedStream, StreamReuse},
+    },
     voice::events::{PlaybackEndHandler, PlaybackErrorHandler},
 };
 
 mod previous;
+mod start_position;
 
 pub use previous::PlaybackPreviousResult;
 
@@ -63,7 +67,7 @@ impl PlaybackService {
         self.validate_player(&player).await?;
         let resolved_track = track.track.clone();
         let operation = player.claim_playback_start(track).await?;
-        self.start_claimed_track(&player, operation, &resolved_track)
+        self.start_claimed_track(&player, operation, &resolved_track, StreamReuse::Allowed)
             .await
     }
 
@@ -75,7 +79,7 @@ impl PlaybackService {
         self.validate_player(&player).await?;
         let (position, claimed_advancer) = player.enqueue_for_playback(track).await?;
         if claimed_advancer {
-            self.advance_claimed_queue(Arc::clone(&player)).await;
+            self.spawn_claimed_queue_advance(Arc::clone(&player)).await;
         }
         self.observer.player_changed(player.guild_id()).await;
         Ok(position)
@@ -92,7 +96,7 @@ impl PlaybackService {
             .enqueue_prefix_for_playback(tracks, expected_session_epoch)
             .await?;
         if claimed_advancer {
-            self.advance_claimed_queue(Arc::clone(&player)).await;
+            self.spawn_claimed_queue_advance(Arc::clone(&player)).await;
         }
         self.observer.player_changed(player.guild_id()).await;
         Ok(receipt)
@@ -234,6 +238,18 @@ impl PlaybackService {
         self.advance_claimed_queue_from(player, next).await;
     }
 
+    /// Starting a track runs `yt-dlp` and opens the audio stream, so enqueueing
+    /// must not wait for it: the slash command reply and the next pending play
+    /// request would both be held back. Claiming the track still happens inline,
+    /// so callers already observe it as the starting track.
+    async fn spawn_claimed_queue_advance(self: &Arc<Self>, player: Arc<GuildPlayer>) {
+        let next = player.take_next_for_advancer().await;
+        let playback = Arc::clone(self);
+        tokio::spawn(async move {
+            playback.advance_claimed_queue_from(player, next).await;
+        });
+    }
+
     async fn advance_claimed_queue_from(
         self: &Arc<Self>,
         player: Arc<GuildPlayer>,
@@ -244,7 +260,7 @@ impl PlaybackService {
                 self.observer.player_changed(player.guild_id()).await;
                 return;
             };
-            let track_id = claimed.track.track.id.clone();
+            let track = claimed.track.clone();
             let operation = claimed.operation;
 
             match self.start_queue_track(&player, claimed).await {
@@ -253,13 +269,18 @@ impl PlaybackService {
                         return;
                     }
                 }
-                Err(error) => warn!(
-                    guild_id = %player.guild_id(),
-                    track_id,
-                    playback_id = operation.playback_id,
-                    error = %error,
-                    "queued track failed; advancing queue"
-                ),
+                Err(error) => {
+                    warn!(
+                        guild_id = %player.guild_id(),
+                        track_id = %track.track.id,
+                        playback_id = operation.playback_id,
+                        error = %error,
+                        "queued track failed; advancing queue"
+                    );
+                    // Silently dropping the track makes the queue look like it lost
+                    // its place, so the skip is reported like any other failure.
+                    self.observer.track_failed(player.guild_id(), &track).await;
+                }
             }
             next = player.take_next_for_advancer().await;
         }
@@ -270,8 +291,13 @@ impl PlaybackService {
         player: &Arc<GuildPlayer>,
         claimed: ClaimedPlayback,
     ) -> Result<(), AppError> {
-        self.start_claimed_track(player, claimed.operation, &claimed.track.track)
-            .await
+        self.start_claimed_track(
+            player,
+            claimed.operation,
+            &claimed.track.track,
+            StreamReuse::Allowed,
+        )
+        .await
     }
 
     async fn start_claimed_track(
@@ -279,17 +305,23 @@ impl PlaybackService {
         player: &Arc<GuildPlayer>,
         operation: PlaybackOperation,
         resolved_track: &crate::player::track::ResolvedTrack,
+        reuse: StreamReuse,
     ) -> Result<(), AppError> {
-        let stream_url = match self.prepare_stream_with_retry(player, resolved_track).await {
-            Ok(url) => url,
+        let stream = match self
+            .prepare_stream_with_retry(player, resolved_track, reuse)
+            .await
+        {
+            Ok(stream) => stream,
             Err(error) => {
                 player.clear_playback(operation).await;
                 return Err(error);
             }
         };
 
+        let start_at_seconds = resolved_track.start_at_seconds;
+        let fallback_stream = start_at_seconds.map(|_| stream.clone());
         let handle = match self
-            .install_paused_track(player, operation, stream_url)
+            .install_paused_track(player, operation, stream, start_at_seconds.is_none())
             .await
         {
             Ok(handle) => handle,
@@ -298,20 +330,16 @@ impl PlaybackService {
                 return Err(error);
             }
         };
-        if let Some(start_at_seconds) = resolved_track.start_at_seconds
-            && let Err(source) = handle
-                .seek_async(Duration::from_secs(start_at_seconds))
-                .await
+        let handle = match self
+            .apply_initial_position(player, operation, resolved_track, handle, fallback_stream)
+            .await
         {
-            player.clear_playback(operation).await;
-            stop_created_handle(&handle);
-            return Err(AppError::Voice {
-                context: format!(
-                    "could not seek track {} to {start_at_seconds} seconds: {source}",
-                    resolved_track.id
-                ),
-            });
-        }
+            Ok(handle) => handle,
+            Err(error) => {
+                player.clear_playback(operation).await;
+                return Err(error);
+            }
+        };
         self.start_installed_track(player, operation, &handle)
             .await?;
 
@@ -329,9 +357,10 @@ impl PlaybackService {
         &self,
         player: &GuildPlayer,
         track: &crate::player::track::ResolvedTrack,
-    ) -> Result<String, AppError> {
-        match self.resolver.prepare_stream(track).await {
-            Ok(url) => Ok(url),
+        reuse: StreamReuse,
+    ) -> Result<PreparedStream, AppError> {
+        match self.resolver.prepare_stream(track, reuse).await {
+            Ok(stream) => Ok(stream),
             Err(first_error) => {
                 warn!(
                     guild_id = %player.guild_id(),
@@ -339,7 +368,9 @@ impl PlaybackService {
                     error = %first_error,
                     "stream preparation failed; retrying once"
                 );
-                self.resolver.prepare_stream(track).await
+                self.resolver
+                    .prepare_stream(track, StreamReuse::Forbidden)
+                    .await
             }
         }
     }
@@ -348,9 +379,10 @@ impl PlaybackService {
         self: &Arc<Self>,
         player: &Arc<GuildPlayer>,
         operation: PlaybackOperation,
-        stream_url: String,
+        stream: PreparedStream,
+        observe_playback: bool,
     ) -> Result<TrackHandle, AppError> {
-        let songbird_track = self.build_paused_track(player, operation, stream_url);
+        let songbird_track = self.build_paused_track(player, operation, stream, observe_playback);
         let call = self
             .songbird
             .get(player.guild_id())
@@ -374,33 +406,88 @@ impl PlaybackService {
         self: &Arc<Self>,
         player: &GuildPlayer,
         operation: PlaybackOperation,
-        stream_url: String,
+        stream: PreparedStream,
+        observe_playback: bool,
     ) -> Track {
-        let input = HttpRequest::new(self.http_client.clone(), stream_url);
+        // Songbird only sends a bounded `range` header when the length is known, and
+        // YouTube throttles range-less requests hard enough to starve the mixer. The
+        // source headers keep the request matching the ones its URL was signed for.
+        let input = HttpRequest {
+            client: self.http_client.clone(),
+            request: stream.url,
+            headers: stream.headers,
+            content_length: stream.content_length,
+        };
         let mut track = Track::from(input).pause();
-        let handler = PlaybackEndHandler::new(
-            Arc::downgrade(self),
-            player.guild_id(),
-            player.instance_id(),
-            operation,
-        );
+        if !observe_playback {
+            return track;
+        }
+        self.add_playback_events(&mut track, player, operation);
+        track
+    }
+
+    fn add_playback_events(
+        self: &Arc<Self>,
+        track: &mut Track,
+        player: &GuildPlayer,
+        operation: PlaybackOperation,
+    ) {
         track.events.add_event(
-            EventData::new(Event::Track(TrackEvent::End), handler),
+            EventData::new(
+                Event::Track(TrackEvent::End),
+                self.playback_end_handler(player, operation),
+            ),
             Duration::ZERO,
         );
         track.events.add_event(
             EventData::new(
                 Event::Track(TrackEvent::Error),
-                PlaybackErrorHandler::new(
-                    Arc::downgrade(self),
-                    player.guild_id(),
-                    player.instance_id(),
-                    operation,
-                ),
+                self.playback_error_handler(player, operation),
             ),
             Duration::ZERO,
         );
-        track
+    }
+
+    fn attach_playback_events(
+        self: &Arc<Self>,
+        player: &GuildPlayer,
+        operation: PlaybackOperation,
+        handle: &TrackHandle,
+    ) -> Result<(), ControlError> {
+        handle.add_event(
+            Event::Track(TrackEvent::End),
+            self.playback_end_handler(player, operation),
+        )?;
+        handle.add_event(
+            Event::Track(TrackEvent::Error),
+            self.playback_error_handler(player, operation),
+        )
+    }
+
+    fn playback_end_handler(
+        self: &Arc<Self>,
+        player: &GuildPlayer,
+        operation: PlaybackOperation,
+    ) -> PlaybackEndHandler {
+        PlaybackEndHandler::new(
+            Arc::downgrade(self),
+            player.guild_id(),
+            player.instance_id(),
+            operation,
+        )
+    }
+
+    fn playback_error_handler(
+        self: &Arc<Self>,
+        player: &GuildPlayer,
+        operation: PlaybackOperation,
+    ) -> PlaybackErrorHandler {
+        PlaybackErrorHandler::new(
+            Arc::downgrade(self),
+            player.guild_id(),
+            player.instance_id(),
+            operation,
+        )
     }
 
     async fn start_installed_track(
@@ -445,8 +532,15 @@ impl PlaybackService {
                     retry_playback_id = claimed.operation.playback_id,
                     "retrying failed track playback"
                 );
+                // The previous attempt died on the stream itself, so the recovery must
+                // resolve a new one instead of replaying the URL that just failed.
                 if let Err(error) = self
-                    .start_claimed_track(&player, claimed.operation, &claimed.track.track)
+                    .start_claimed_track(
+                        &player,
+                        claimed.operation,
+                        &claimed.track.track,
+                        StreamReuse::Forbidden,
+                    )
                     .await
                 {
                     warn!(

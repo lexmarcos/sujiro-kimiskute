@@ -37,7 +37,7 @@ impl GuildSessionService {
             LeaveClaim::Ready(operation) => operation,
             LeaveClaim::AlreadyClosing => return Err(already_closing_error(player.guild_id())),
         };
-        self.finalize_claimed_leave(player, operation).await
+        self.finalize_claimed_leave(player, *operation).await
     }
 
     pub(crate) async fn finalize_claimed_leave(

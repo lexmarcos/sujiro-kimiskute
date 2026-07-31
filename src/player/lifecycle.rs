@@ -12,7 +12,7 @@ pub(super) enum PlayerLifecycle {
 
 pub(crate) enum LeaveClaim {
     AlreadyClosing,
-    Ready(LeaveOperation),
+    Ready(Box<LeaveOperation>),
 }
 
 pub(crate) struct LeaveOperation {

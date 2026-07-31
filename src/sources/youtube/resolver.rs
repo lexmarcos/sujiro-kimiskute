@@ -8,9 +8,12 @@ use crate::{
     error::AppError,
     player::track::ResolvedTrack,
     sources::{
-        resolver::{TrackInputKind, TrackResolution, TrackResolver, normalize_track_input},
+        resolver::{
+            PreparedStream, StreamReuse, TrackInputKind, TrackResolution, TrackResolver,
+            normalize_track_input,
+        },
         youtube::{
-            metadata::{parse_stream_url, parse_tracks},
+            metadata::{parse_prepared_stream, parse_tracks},
             process::YoutubeProcess,
         },
     },
@@ -70,13 +73,27 @@ impl TrackResolver for YoutubeResolver {
         result
     }
 
-    async fn prepare_stream(&self, track: &ResolvedTrack) -> Result<String, AppError> {
+    async fn prepare_stream(
+        &self,
+        track: &ResolvedTrack,
+        reuse: StreamReuse,
+    ) -> Result<PreparedStream, AppError> {
+        if reuse == StreamReuse::Allowed
+            && let Some(stream) = reusable_stream(track)
+        {
+            info!(
+                track_id = %track.id,
+                "reusing the stream selected while resolving the track"
+            );
+            return Ok(stream.clone());
+        }
+
         let input_length = track.webpage_url.len();
         let started_at = Instant::now();
         let input = ResolvedInput::parse_video_url(&track.webpage_url)?;
         let document = self.process.execute(&resolution_arguments(&input, 1)).await;
         let result = match document {
-            Ok(document) => parse_stream_url(&document),
+            Ok(document) => parse_prepared_stream(&document),
             Err(error) => Err(error),
         };
 
@@ -169,6 +186,14 @@ impl ResolvedInput {
     }
 }
 
+fn reusable_stream(track: &ResolvedTrack) -> Option<&PreparedStream> {
+    let stream = track.prepared_stream.as_ref()?;
+    stream
+        .reuse_until
+        .is_some_and(|reuse_until| reuse_until > std::time::SystemTime::now())
+        .then_some(stream)
+}
+
 fn resolution_arguments(input: &ResolvedInput, max_playlist_size: usize) -> Vec<String> {
     let mut arguments = base_arguments();
     match input {
@@ -239,24 +264,8 @@ fn is_playlist_url(url: &Url) -> bool {
     if path == "/playlist" {
         return true;
     }
-    if has_selected_video(url) || is_direct_video_path(url, path) {
-        return false;
-    }
-    url.query_pairs().any(|(key, _)| key == "list")
-}
-
-fn has_selected_video(url: &Url) -> bool {
     url.query_pairs()
-        .any(|(key, value)| key == "v" && !value.is_empty())
-}
-
-fn is_direct_video_path(url: &Url, path: &str) -> bool {
-    url.host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case("youtu.be"))
-        && path.len() > 1
-        || path.starts_with("/shorts/")
-        || path.starts_with("/live/")
-        || path.starts_with("/embed/")
+        .any(|(key, value)| key == "list" && !value.is_empty())
 }
 
 fn start_at_seconds(url: &Url) -> Option<u64> {
@@ -355,7 +364,7 @@ fn log_resolution(
 fn log_stream_preparation(
     input_length: usize,
     started_at: Instant,
-    result: &Result<String, AppError>,
+    result: &Result<PreparedStream, AppError>,
 ) {
     let duration_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     match result {

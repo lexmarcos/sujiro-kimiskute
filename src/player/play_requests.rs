@@ -231,16 +231,12 @@ impl PlayRequestSequencer {
 
     pub async fn take_next(&self) -> Option<PendingPlayRequest> {
         let mut state = self.inner.lock().await;
-        let next_commit = state.next_commit;
-        let Some(PlayRequestSlot::Ready(request)) = state.slots.remove(&next_commit) else {
+        let request = state.take_ready();
+        if request.is_none() {
             state.draining = false;
-            self.changed.notify_waiters();
-            return None;
-        };
-        state.next_commit = state.next_commit.wrapping_add(1);
-        state.advance_over_gaps();
+        }
         self.changed.notify_waiters();
-        Some(request)
+        request
     }
 
     pub async fn invalidate_before_epoch(&self, current_epoch: u64) -> usize {
@@ -319,6 +315,24 @@ impl SequencerState {
         })
     }
 
+    /// Commits stay in reservation order, so a slot that is still resolving must
+    /// be left untouched: removing it would drop the caller's response channel
+    /// and strand `next_commit` on a sequence that can never become ready.
+    fn take_ready(&mut self) -> Option<PendingPlayRequest> {
+        let sequence = self.next_commit;
+        match self.slots.remove(&sequence)?.into_ready() {
+            Ok(request) => {
+                self.next_commit = self.next_commit.wrapping_add(1);
+                self.advance_over_gaps();
+                Some(request)
+            }
+            Err(resolving) => {
+                self.slots.insert(sequence, resolving);
+                None
+            }
+        }
+    }
+
     fn advance_over_gaps(&mut self) {
         while self.next_commit < self.next_reservation
             && !self.slots.contains_key(&self.next_commit)
@@ -328,12 +342,16 @@ impl SequencerState {
     }
 
     fn start_draining_if_ready(&mut self) -> bool {
-        if self.draining
-            || !matches!(
-                self.slots.get(&self.next_commit),
-                Some(PlayRequestSlot::Ready(_))
-            )
-        {
+        if self.draining {
+            return false;
+        }
+        // A removed slot must never wedge the pipeline: without skipping it, every
+        // later request would wait forever for a sequence that no longer exists.
+        self.advance_over_gaps();
+        if !matches!(
+            self.slots.get(&self.next_commit),
+            Some(PlayRequestSlot::Ready(_))
+        ) {
             return false;
         }
         self.draining = true;
@@ -353,6 +371,13 @@ impl PlayRequestSlot {
         match self {
             Self::Resolving(request) => request.requested_by,
             Self::Ready(request) => request.requested_by,
+        }
+    }
+
+    fn into_ready(self) -> Result<PendingPlayRequest, Self> {
+        match self {
+            Self::Ready(request) => Ok(request),
+            resolving @ Self::Resolving(_) => Err(resolving),
         }
     }
 

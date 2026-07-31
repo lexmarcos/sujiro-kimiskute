@@ -10,6 +10,7 @@ use crate::{
         playback_state::{PreviousPlayback, PreviousPlaybackClaim},
         track::QueuedTrack,
     },
+    sources::resolver::StreamReuse,
 };
 
 impl PlaybackService {
@@ -32,7 +33,12 @@ impl PlaybackService {
     ) -> Result<PlaybackPreviousResult, AppError> {
         stop_interrupted_handle(&player, &previous);
         if let Err(error) = self
-            .start_claimed_track(&player, previous.operation, &previous.track.track)
+            .start_claimed_track(
+                &player,
+                previous.operation,
+                &previous.track.track,
+                StreamReuse::Allowed,
+            )
             .await
         {
             self.spawn_queue_advancer_if_claimed(Arc::clone(&player))

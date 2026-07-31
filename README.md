@@ -97,7 +97,7 @@ Restart the bot after changing any of these.
 
 - YouTube, YouTube Music, `youtu.be`, and Shorts links are accepted.
 - Shared `t=` or `start=` timestamps begin playback at that position.
-- A watch URL containing `list=` plays the selected video; an explicit `/playlist` URL queues the playlist.
+- A YouTube URL containing a non-empty `list=` parameter queues the playlist, including watch URLs that also select a video with `v=`.
 - Playlist requests show loading feedback and can be canceled before they are committed to the queue.
 - The final response reports unavailable playlist entries and tracks omitted by the queue limit.
 - The latest `/play` or `/queue` response becomes the single live player panel, shows current and queue timing estimates, and updates as playback changes.

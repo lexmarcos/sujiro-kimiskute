@@ -12,7 +12,7 @@ use tokio::{
     sync::{Notify, Semaphore, SemaphorePermit, TryAcquireError},
     time::timeout,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{error::AppError, sources::youtube::extractor_args::with_required_youtube_arguments};
 
@@ -105,6 +105,7 @@ impl YoutubeProcess {
         let output = self.execute_with_timeout(arguments, started_at).await?;
         let status = exit_status(&output);
         log_process_finished(started_at, &status, output.stderr.len());
+        log_process_diagnostics(&output);
 
         if !output.status.success() {
             return Err(unsuccessful_status_error(output.status.code()));
@@ -156,6 +157,76 @@ fn log_process_finished(started_at: Instant, status: &str, stderr_len: usize) {
         duration_ms = started_at.elapsed().as_secs_f64() * 1_000.0,
         status, stderr_len, "yt-dlp process finished"
     );
+}
+
+/// Enough of yt-dlp's own diagnostics to act on, without letting a verbose run
+/// flood the log.
+const MAX_DIAGNOSTIC_LINES: usize = 5;
+const MAX_DIAGNOSTIC_CHARS: usize = 600;
+
+/// Reports what yt-dlp complained about. A successful run still gets logged,
+/// because warnings such as a missing JavaScript runtime only become visible as
+/// a failure much later, when the audio driver is refused the media URL.
+fn log_process_diagnostics(output: &Output) {
+    let Some(diagnostics) = diagnostic_lines(&output.stderr) else {
+        return;
+    };
+    if output.status.success() {
+        info!(diagnostics, "yt-dlp reported diagnostics");
+        return;
+    }
+    warn!(diagnostics, "yt-dlp reported diagnostics");
+}
+
+fn diagnostic_lines(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let collected = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("WARNING:") || line.starts_with("ERROR:"))
+        .take(MAX_DIAGNOSTIC_LINES)
+        .map(without_url_queries)
+        .collect::<Vec<String>>()
+        .join(" | ");
+    if collected.is_empty() {
+        return None;
+    }
+    Some(truncated(collected))
+}
+
+/// Drops the query string of every URL in the line. yt-dlp quotes signed media
+/// URLs in some messages, and those carry the PO token and signature.
+fn without_url_queries(line: &str) -> String {
+    let mut sanitized = String::with_capacity(line.len());
+    let mut rest = line;
+
+    while let Some(scheme_at) = rest.find("://") {
+        let after_scheme = scheme_at + "://".len();
+        let url_end = rest[after_scheme..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |end| after_scheme + end);
+        let (url, remainder) = rest.split_at(url_end);
+        match url.find('?') {
+            Some(query_at) => {
+                sanitized.push_str(&url[..query_at]);
+                sanitized.push_str("?<redacted>");
+            }
+            None => sanitized.push_str(url),
+        }
+        rest = remainder;
+    }
+
+    sanitized.push_str(rest);
+    sanitized
+}
+
+fn truncated(mut value: String) -> String {
+    let Some((cut, _)) = value.char_indices().nth(MAX_DIAGNOSTIC_CHARS) else {
+        return value;
+    };
+    value.truncate(cut);
+    value.push('…');
+    value
 }
 
 fn process_start_error(source: std::io::Error) -> AppError {

@@ -237,10 +237,13 @@ fn resolution_arguments(input: &ResolvedInput, max_playlist_size: usize) -> Vec<
     arguments
 }
 
+/// `--no-warnings` is deliberately absent: yt-dlp explains a missing JavaScript
+/// runtime, a client that needs a PO token, or an extractor change on stderr,
+/// and those lines are the only clue when resolution succeeds but the media URL
+/// is rejected later. `process` logs them.
 fn base_arguments() -> Vec<String> {
     [
         "--dump-single-json",
-        "--no-warnings",
         "--no-progress",
         "--skip-download",
         "--format",

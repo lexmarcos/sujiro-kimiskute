@@ -125,6 +125,8 @@ Sujiro itself is cheap: YouTube's Opus audio is passed straight through to Disco
 
 Measure on your own device with `RUST_LOG=info`: every resolution logs `yt-dlp process finished` with its `duration_ms`.
 
+When yt-dlp warns about something — no JavaScript runtime, a client that needs a PO token, an extractor change — the bot logs it as `yt-dlp reported diagnostics`, even when the run succeeded. Those warnings are usually the only clue when resolution works but playback then fails with an HTTP error, so read them before suspecting the bot. URLs in them have their query string redacted, since signed media URLs carry PO tokens and signatures.
+
 ## YouTube PO tokens
 
 A Proof of Origin (PO) token lets YouTube verify that a request came from a genuine client. YouTube is gradually enforcing these; without one, yt-dlp may expose fewer formats, hit HTTP 403 responses, or get the account or IP temporarily blocked.

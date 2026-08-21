@@ -113,6 +113,8 @@ O Sujiro em si é barato: o áudio Opus do YouTube é repassado direto ao Discor
 
 Meça no seu próprio aparelho com `RUST_LOG=info`: toda resolução registra `yt-dlp process finished` com seu `duration_ms`.
 
+Quando o yt-dlp avisa alguma coisa — falta de runtime JavaScript, um cliente que exige PO token, mudança de extractor — o bot registra como `yt-dlp reported diagnostics`, mesmo quando a execução deu certo. Esses avisos costumam ser a única pista quando a resolução funciona mas a reprodução falha depois com erro HTTP, então leia-os antes de suspeitar do bot. URLs neles têm a query string redigida, já que URLs de mídia assinadas carregam PO token e assinatura.
+
 ## Tokens PO do YouTube
 
 Um token de Proof of Origin (PO) permite que o YouTube verifique que a requisição veio de um cliente legítimo. O YouTube está aplicando isso aos poucos. Sem um token, o yt-dlp pode expor menos formatos, receber respostas HTTP 403 ou ter a conta ou o IP bloqueados temporariamente.

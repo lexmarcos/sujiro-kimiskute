@@ -8,7 +8,8 @@ use std::{
 
 use tokio::{
     process::Command,
-    sync::{Semaphore, SemaphorePermit, TryAcquireError},
+    select,
+    sync::{Notify, Semaphore, SemaphorePermit, TryAcquireError},
     time::timeout,
 };
 use tracing::info;
@@ -20,6 +21,9 @@ pub struct YoutubeProcess {
     extra_arguments: Vec<String>,
     execution_timeout: Duration,
     resolution_slots: Arc<Semaphore>,
+    /// Asks running background resolutions to stop so an interactive request can
+    /// take their slot.
+    preempt_background: Notify,
 }
 
 impl YoutubeProcess {
@@ -34,31 +38,60 @@ impl YoutubeProcess {
             extra_arguments: with_required_youtube_arguments(extra_arguments),
             execution_timeout,
             resolution_slots,
+            preempt_background: Notify::new(),
         }
     }
 
     pub async fn execute(&self, arguments: &[String]) -> Result<String, AppError> {
-        let permit = self
-            .resolution_slots
-            .acquire()
-            .await
-            .map_err(|_| semaphore_closed_error())?;
+        let permit = match self.resolution_slots.try_acquire() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => self.wait_for_slot().await?,
+            Err(TryAcquireError::Closed) => return Err(semaphore_closed_error()),
+        };
         self.execute_with_slot(arguments, permit).await
     }
 
-    /// Runs yt-dlp only when a resolution slot is free right now, so background
-    /// work never queues ahead of a user's command. Returns `Ok(None)` when every
-    /// slot is busy.
+    /// Waits for a slot after asking background resolutions to release theirs.
+    /// A command must not queue behind speculative work: with a single
+    /// configured slot, that would add a whole yt-dlp run to its latency.
+    /// Every running prefetch stops, which frees more slots than this caller
+    /// needs but keeps the release path free of slot accounting.
+    async fn wait_for_slot(&self) -> Result<SemaphorePermit<'_>, AppError> {
+        self.preempt_background.notify_waiters();
+        self.resolution_slots
+            .acquire()
+            .await
+            .map_err(|_| semaphore_closed_error())
+    }
+
+    /// Runs yt-dlp only while no interactive request needs the slot: it never
+    /// waits for one, and gives the slot up as soon as a command asks for it.
+    /// Returns `Ok(None)` in both cases, leaving the caller to resolve normally
+    /// when the track is actually played.
     pub async fn execute_without_waiting(
         &self,
         arguments: &[String],
     ) -> Result<Option<String>, AppError> {
+        // Registered before the slot is taken so a preemption signal raised while
+        // acquiring is still observed: `notify_waiters` only wakes waiters that
+        // already exist.
+        let preempted = self.preempt_background.notified();
+        tokio::pin!(preempted);
+        preempted.as_mut().enable();
+
         let permit = match self.resolution_slots.try_acquire() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => return Ok(None),
             Err(TryAcquireError::Closed) => return Err(semaphore_closed_error()),
         };
-        self.execute_with_slot(arguments, permit).await.map(Some)
+
+        // Dropping the execution future releases the slot, and `kill_on_drop`
+        // stops the yt-dlp process it left running.
+        select! {
+            biased;
+            () = &mut preempted => Ok(None),
+            result = self.execute_with_slot(arguments, permit) => result.map(Some),
+        }
     }
 
     async fn execute_with_slot(

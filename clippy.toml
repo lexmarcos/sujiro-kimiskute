@@ -1,0 +1,9 @@
+# `serenity::Error` is 136 bytes and is what Serenity's own API returns, so every
+# command handler that propagates it trips `result_large_err` at the default
+# threshold of 128. Boxing it at each call site would add a `map_err` to every
+# `?` on a once-per-interaction path without a measurable win, so the threshold
+# accepts exactly that type: the lint fires at `size >= threshold`, and 137 is
+# the lowest value that admits 136 bytes. Error types the bot owns stay covered,
+# and `Cargo.lock` plus `--locked` in CI keep Serenity's size from shifting
+# unnoticed.
+large-error-threshold = 137

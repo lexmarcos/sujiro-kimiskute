@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A pull request that is pushed again should not keep an outdated run going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: fmt, clippy, release build
@@ -21,7 +26,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libopus-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned instead of `@stable` because `clippy -- -D warnings` is a hard
+      # gate: a Rust release that adds or tightens a lint turns unrelated pull
+      # requests red. Rust 1.98.0 did exactly that with `result_large_err`, and
+      # it failed on code already released in v0.3.0. Bump this deliberately and
+      # fix whatever the new toolchain reports in the same commit.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
 
@@ -30,8 +40,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # `--locked` matches the release build: without it, linting may quietly
+      # update Cargo.lock and check something the build step will not.
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Release build
         run: cargo build --locked --release

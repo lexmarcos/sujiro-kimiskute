@@ -6,10 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{process::Command, sync::Semaphore, time::timeout};
+use tokio::{
+    process::Command,
+    sync::{Semaphore, SemaphorePermit, TryAcquireError},
+    time::timeout,
+};
 use tracing::info;
 
-use crate::error::AppError;
+use crate::{error::AppError, sources::youtube::extractor_args::with_required_youtube_arguments};
 
 pub struct YoutubeProcess {
     executable_path: PathBuf,
@@ -27,18 +31,41 @@ impl YoutubeProcess {
     ) -> Self {
         Self {
             executable_path,
-            extra_arguments,
+            extra_arguments: with_required_youtube_arguments(extra_arguments),
             execution_timeout,
             resolution_slots,
         }
     }
 
     pub async fn execute(&self, arguments: &[String]) -> Result<String, AppError> {
-        let _permit = self
+        let permit = self
             .resolution_slots
             .acquire()
             .await
             .map_err(|_| semaphore_closed_error())?;
+        self.execute_with_slot(arguments, permit).await
+    }
+
+    /// Runs yt-dlp only when a resolution slot is free right now, so background
+    /// work never queues ahead of a user's command. Returns `Ok(None)` when every
+    /// slot is busy.
+    pub async fn execute_without_waiting(
+        &self,
+        arguments: &[String],
+    ) -> Result<Option<String>, AppError> {
+        let permit = match self.resolution_slots.try_acquire() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Ok(None),
+            Err(TryAcquireError::Closed) => return Err(semaphore_closed_error()),
+        };
+        self.execute_with_slot(arguments, permit).await.map(Some)
+    }
+
+    async fn execute_with_slot(
+        &self,
+        arguments: &[String],
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<String, AppError> {
         let started_at = Instant::now();
 
         info!("yt-dlp process starting");

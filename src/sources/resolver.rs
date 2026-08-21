@@ -33,6 +33,13 @@ pub struct PreparedStream {
     pub reuse_until: Option<SystemTime>,
 }
 
+impl PreparedStream {
+    pub fn is_reusable_at(&self, now: SystemTime) -> bool {
+        self.reuse_until
+            .is_some_and(|reuse_until| reuse_until > now)
+    }
+}
+
 /// Whether a stream already attached to a track may be replayed. Resolution
 /// yields a usable stream for single tracks, so the common path can skip a
 /// second process launch; a playback failure must not reuse the same URL.
@@ -53,6 +60,15 @@ pub trait TrackResolver: Send + Sync {
         track: &ResolvedTrack,
         reuse: StreamReuse,
     ) -> Result<PreparedStream, AppError>;
+
+    /// Best-effort stream preparation for a track that is still queued, so its
+    /// playback can start without resolving inline. Returns `Ok(None)` when the
+    /// source would have to wait for a resolution slot: background work must
+    /// never delay an interactive request.
+    async fn prefetch_stream(
+        &self,
+        track: &ResolvedTrack,
+    ) -> Result<Option<PreparedStream>, AppError>;
 }
 
 pub fn normalize_track_input(input: &str) -> Result<&str, AppError> {

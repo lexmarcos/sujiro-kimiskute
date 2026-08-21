@@ -3,6 +3,11 @@ set -Eeuo pipefail
 umask 077
 readonly REPOSITORY="lexmarcos/sujiro-kimiskute"
 readonly YT_DLP_REPOSITORY="yt-dlp/yt-dlp"
+# The zipapp needs a system Python but starts faster than the standalone
+# PyInstaller build, which unpacks ~40 MB into /tmp on every single run.
+readonly YT_DLP_ZIPAPP_ASSET="yt-dlp"
+readonly YT_DLP_MIN_PYTHON_MAJOR=3
+readonly YT_DLP_MIN_PYTHON_MINOR=10
 readonly USER_HOME="${HOME:-}"
 readonly DEFAULT_INSTALL_DIR="${XDG_DATA_HOME:-${USER_HOME}/.local/share}/sujiro-kimiskute"
 readonly DEFAULT_BIN_DIR="${USER_HOME}/.local/bin"
@@ -95,11 +100,11 @@ detect_platform() {
     case "${architecture}" in
         x86_64 | amd64)
             BOT_PLATFORM="linux-x86_64"
-            YT_DLP_ASSET="yt-dlp_linux"
+            YT_DLP_STANDALONE_ASSET="yt-dlp_linux"
             ;;
         aarch64 | arm64)
             BOT_PLATFORM="linux-arm64"
-            YT_DLP_ASSET="yt-dlp_linux_aarch64"
+            YT_DLP_STANDALONE_ASSET="yt-dlp_linux_aarch64"
             ;;
         *)
             fail_installation "Unsupported architecture: ${architecture}. Supported: x86_64 and arm64."
@@ -274,13 +279,35 @@ find_or_download_yt_dlp() {
     download_yt_dlp
 }
 
+python_supports_yt_dlp_zipapp() {
+    local python_path
+    python_path="$(type -P python3 || true)"
+    [[ -n "${python_path}" ]] || return 1
+    timeout 10 "${python_path}" -c "import sys
+raise SystemExit(0 if sys.version_info >= (${YT_DLP_MIN_PYTHON_MAJOR}, ${YT_DLP_MIN_PYTHON_MINOR}) else 1)" \
+        >/dev/null 2>&1
+}
+
+select_yt_dlp_build() {
+    local python_version="${YT_DLP_MIN_PYTHON_MAJOR}.${YT_DLP_MIN_PYTHON_MINOR}"
+    if python_supports_yt_dlp_zipapp; then
+        YT_DLP_ASSET="${YT_DLP_ZIPAPP_ASSET}"
+        YT_DLP_BUILD_REASON="Python ${python_version}+ found: the zipapp build starts faster, does not unpack itself on every run, and self-updates with 'yt-dlp -U'."
+        return
+    fi
+    YT_DLP_ASSET="${YT_DLP_STANDALONE_ASSET}"
+    YT_DLP_BUILD_REASON="Python ${python_version}+ not found: using the standalone build. Installing Python makes yt-dlp start noticeably faster on small hosts."
+}
+
 download_yt_dlp() {
     local release_url checksum_list expected actual
+    select_yt_dlp_build
     release_url="https://github.com/${YT_DLP_REPOSITORY}/releases/latest/download"
     YT_DLP_CANDIDATE="${TEMP_DIR}/${YT_DLP_ASSET}"
     checksum_list="${TEMP_DIR}/SHA2-256SUMS"
 
     print_step "yt-dlp was not found; downloading the official ${YT_DLP_ASSET} build"
+    printf '    %s\n' "${YT_DLP_BUILD_REASON}"
     download_file "${release_url}/${YT_DLP_ASSET}" "${YT_DLP_CANDIDATE}"
     download_file "${release_url}/SHA2-256SUMS" "${checksum_list}"
     expected="$(expected_checksum "${checksum_list}" "${YT_DLP_ASSET}")" || {
@@ -377,6 +404,48 @@ require_interactive_terminal() {
     }
 }
 
+detect_host_resources() {
+    HOST_CPU_COUNT="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "${HOST_CPU_COUNT}" =~ ^[1-9][0-9]*$ ]] || HOST_CPU_COUNT=1
+    HOST_MEMORY_MB="$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null || true)"
+    [[ "${HOST_MEMORY_MB}" =~ ^[0-9]+$ ]] || HOST_MEMORY_MB=0
+}
+
+low_power_host() {
+    ((HOST_CPU_COUNT <= 2)) || ((HOST_MEMORY_MB > 0 && HOST_MEMORY_MB <= 2048))
+}
+
+# yt-dlp solves YouTube's JS challenge with a JavaScript runtime: ~2 CPU seconds
+# and ~300 MB per run on a desktop, ten times slower on low-end ARM. Small hosts
+# need fewer parallel runs, a longer timeout, and fewer requests per track.
+apply_resolution_defaults() {
+    YT_DLP_EXTRA_ARGS=""
+    YT_DLP_TIMEOUT_SECONDS="45"
+    MAX_CONCURRENT_RESOLUTIONS="2"
+    detect_host_resources
+    low_power_host || return 0
+
+    YT_DLP_TIMEOUT_SECONDS="60"
+    ((HOST_CPU_COUNT > 1 && HOST_MEMORY_MB > 1024)) || MAX_CONCURRENT_RESOLUTIONS="1"
+    YT_DLP_EXTRA_ARGS="--extractor-args youtube:player_skip=webpage,configs"
+    print_step "Low-power host detected (${HOST_CPU_COUNT} CPU, ${HOST_MEMORY_MB} MB RAM)"
+    printf 'Applying the low-power yt-dlp profile: %s concurrent resolution(s), %s s timeout,\n' \
+        "${MAX_CONCURRENT_RESOLUTIONS}" "${YT_DLP_TIMEOUT_SECONDS}"
+    printf 'and skipping the YouTube watch page download (YT_DLP_EXTRA_ARGS=%s).\n' \
+        "${YT_DLP_EXTRA_ARGS}"
+    printf 'Remove player_skip from YT_DLP_EXTRA_ARGS if you use PO tokens with web clients.\n'
+}
+
+prompt_extra_yt_dlp_arguments() {
+    local response
+    response="$(prompt_secret "Extra yt-dlp arguments (Enter keeps '${YT_DLP_EXTRA_ARGS:-none}', type none to clear)")"
+    case "${response}" in
+        "") printf '%s' "${YT_DLP_EXTRA_ARGS}" ;;
+        none) printf '' ;;
+        *) printf '%s' "${response}" ;;
+    esac
+}
+
 collect_configuration() {
     require_interactive_terminal
     print_step "Discord configuration"
@@ -391,15 +460,13 @@ collect_configuration() {
         fail_installation "The Discord activity message cannot be empty."
     }
 
-    YT_DLP_EXTRA_ARGS=""
-    YT_DLP_TIMEOUT_SECONDS="20"
     AUTO_LEAVE_SECONDS="120"
     MAX_QUEUE_SIZE="50"
-    MAX_CONCURRENT_RESOLUTIONS="4"
     RUST_LOG="info"
+    apply_resolution_defaults
 
     if prompt_yes_no "Configure advanced settings?"; then
-        YT_DLP_EXTRA_ARGS="$(prompt_secret "Extra yt-dlp arguments (optional)")"
+        YT_DLP_EXTRA_ARGS="$(prompt_extra_yt_dlp_arguments)"
         YT_DLP_TIMEOUT_SECONDS="$(prompt_positive_integer \
             "yt-dlp timeout in seconds" "${YT_DLP_TIMEOUT_SECONDS}")"
         AUTO_LEAVE_SECONDS="$(prompt_positive_integer \

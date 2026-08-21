@@ -21,7 +21,7 @@ RUN apt-get update \
         ffmpeg \
         libopus0 \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m pip install --no-cache-dir --disable-pip-version-check yt-dlp \
+    && python -m pip install --no-cache-dir --disable-pip-version-check 'yt-dlp[default]' \
     && groupadd --gid 10001 musicbot \
     && useradd --uid 10001 --gid musicbot --no-log-init \
         --create-home --home-dir /home/musicbot --shell /bin/false musicbot

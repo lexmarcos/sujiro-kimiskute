@@ -1,6 +1,6 @@
 use songbird::tracks::TrackHandle;
 
-use crate::player::track::QueuedTrack;
+use crate::{player::track::QueuedTrack, sources::resolver::PreparedStream};
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum PlaybackState {
@@ -85,4 +85,30 @@ pub(crate) struct StoppedPlayback {
     pub handle: Option<TrackHandle>,
     pub removed_from_queue: usize,
     pub session_epoch: u64,
+}
+
+pub(crate) enum StreamPrefetchResult {
+    Ready(PreparedStream),
+    /// Every resolution slot was busy; the track is retried on the next trigger.
+    Busy,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StreamPrefetchOutcome {
+    Attached,
+    /// The stream was not stored: the source was busy, or the track left the
+    /// queue before the prefetch finished.
+    Skipped,
+    Failed,
+}
+
+impl StreamPrefetchOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
 }

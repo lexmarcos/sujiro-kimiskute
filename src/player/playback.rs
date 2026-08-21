@@ -29,6 +29,7 @@ use crate::{
     voice::events::{PlaybackEndHandler, PlaybackErrorHandler},
 };
 
+mod prefetch;
 mod previous;
 mod start_position;
 
@@ -80,6 +81,8 @@ impl PlaybackService {
         let (position, claimed_advancer) = player.enqueue_for_playback(track).await?;
         if claimed_advancer {
             self.spawn_claimed_queue_advance(Arc::clone(&player)).await;
+        } else {
+            self.spawn_next_stream_prefetch(Arc::clone(&player));
         }
         self.observer.player_changed(player.guild_id()).await;
         Ok(position)
@@ -97,6 +100,8 @@ impl PlaybackService {
             .await?;
         if claimed_advancer {
             self.spawn_claimed_queue_advance(Arc::clone(&player)).await;
+        } else {
+            self.spawn_next_stream_prefetch(Arc::clone(&player));
         }
         self.observer.player_changed(player.guild_id()).await;
         Ok(receipt)
@@ -349,6 +354,9 @@ impl PlaybackService {
             playback_id = operation.playback_id,
             "track playback started"
         );
+        // The track just claimed its resolution slot and released it, so this is
+        // the moment a prefetch is least likely to compete with user commands.
+        self.spawn_next_stream_prefetch(Arc::clone(player));
         self.observer.player_changed(player.guild_id()).await;
         Ok(())
     }

@@ -10,7 +10,7 @@ It is light enough to run on a Raspberry Pi, a cheap VPS, or even an Android pho
 
 ## Install in one command
 
-On any 64-bit Linux system this is all you need. The installer detects your CPU (x86_64 or ARM64), downloads and verifies the matching release, installs `yt-dlp` if it is missing, and walks you through creating the `.env` file:
+On any 64-bit Linux system this is all you need. The installer detects your CPU (x86_64 or ARM64), downloads and verifies the matching release, installs `yt-dlp` if it is missing (the official zipapp when Python 3.10+ is available, the standalone binary otherwise), sizes the yt-dlp settings for your host, and walks you through creating the `.env` file:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/lexmarcos/sujiro-kimiskute/main/install.sh
@@ -58,7 +58,7 @@ Install the dependencies (Ubuntu / Debian):
 
 ```bash
 sudo apt install -y build-essential pkg-config libopus-dev ffmpeg pipx
-pipx ensurepath && pipx install yt-dlp
+pipx ensurepath && pipx install 'yt-dlp[default]'
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust 1.88+
 ```
 
@@ -90,6 +90,9 @@ Notable settings:
 - `BOT_ACTIVITY_CURRENT_TRACK=true` shows the current title when exactly one server is actively playing. With zero or multiple active servers, the bot uses the configured static activity.
 - `PLAYER_PANEL_UPDATE_SECONDS` controls live playback-progress updates. It defaults to `5`; positive values set the interval in seconds. Set it to `0` to disable the progress display and periodic panel edits while keeping immediate updates for pause, skip, stop, and track changes.
 - `IDLE_LEAVE_SECONDS` disconnects after the queue finishes even if listeners remain. It defaults to 300 seconds; set it to `0` to disable it.
+- `YT_DLP_EXTRA_ARGS` passes extra flags to yt-dlp (shell-style quoting). The bot always adds `skip=hls,dash` to your `youtube:` extractor arguments because it can only play plain HTTP streams. Keep every YouTube setting in a single `--extractor-args youtube:...` value: yt-dlp only keeps the last one per extractor, and the one the bot passes also overrides a `youtube:` section in a yt-dlp config file.
+- `YT_DLP_TIMEOUT_SECONDS` (default `45`) bounds each yt-dlp run. YouTube's JS challenge takes about two CPU seconds on a desktop and ten times that on a low-end ARM board, so use `60` there.
+- `MAX_CONCURRENT_RESOLUTIONS` (default `2`) caps parallel yt-dlp runs. Each can peak near 300 MB when a JavaScript runtime is involved; use `1` on hosts with one vCPU or 1 GB of RAM.
 
 Restart the bot after changing any of these.
 
@@ -102,6 +105,25 @@ Restart the bot after changing any of these.
 - The final response reports unavailable playlist entries and tracks omitted by the queue limit.
 - The latest `/play` or `/queue` response becomes the single live player panel, shows current and queue timing estimates, and updates as playback changes.
 - If a stream fails, the bot refreshes it once. If recovery also fails, the unavailable track is skipped and the channel is notified.
+- While a track plays, the stream of the next queued track is prepared in the background, so the transition does not wait for yt-dlp. The prefetch only runs when a resolution slot is free.
+
+## Low-power hosts
+
+Sujiro itself is cheap: YouTube's Opus audio is passed straight through to Discord without decoding. Almost all CPU, memory, and waiting go to `yt-dlp`, and three choices decide how much:
+
+1. **JavaScript runtime.** Recent yt-dlp solves YouTube's player challenge with Deno (or Node via `--js-runtimes node`). Measured on a desktop, one resolution costs about 0.6 CPU seconds and 60 MB without a runtime versus 2 CPU seconds, 300 MB, and one more request with one; low-end ARM boards are roughly ten times slower. Without a runtime yt-dlp falls back to a single client that needs no challenge. That works today, but yt-dlp marks it deprecated and YouTube changes which clients work without PO tokens. On a weak host, start without a runtime and add Deno (or `--js-runtimes node` in `YT_DLP_EXTRA_ARGS`) only when playback breaks.
+2. **Requests per track.** The bot already skips the HLS and DASH manifests. `player_skip=webpage,configs` also skips the 1.4 MB watch page and shrinks yt-dlp's output from about 600 KB to 100 KB of JSON:
+
+   ```dotenv
+   YT_DLP_EXTRA_ARGS=--extractor-args youtube:player_skip=webpage,configs
+   YT_DLP_TIMEOUT_SECONDS=60
+   MAX_CONCURRENT_RESOLUTIONS=1
+   ```
+
+   The installer applies this profile on hosts with up to 2 CPUs or 2 GB of RAM. Drop `player_skip` if you use PO tokens with web clients: they need the watch page.
+3. **How yt-dlp is installed.** `pip install 'yt-dlp[default]'` (or pipx) starts in about 0.15 s on a desktop, the zipapp in 0.5 s, and the standalone `yt-dlp_linux` binary in 0.6 s while unpacking 40 MB into `/tmp` on every run, which hurts on slow storage and under proot (UserLAnd). The installer prefers the zipapp whenever Python 3.10+ is present. Keep yt-dlp updated (`yt-dlp -U`) and keep `~/.cache/yt-dlp` writable and persistent: it stores solved player signatures.
+
+Measure on your own device with `RUST_LOG=info`: every resolution logs `yt-dlp process finished` with its `duration_ms`.
 
 ## YouTube PO tokens
 
@@ -118,6 +140,8 @@ Manual setup is possible but advanced and not recommended:
 ```dotenv
 YT_DLP_EXTRA_ARGS=--extractor-args youtube:player_client=mweb;po_token=mweb.gvs+TOKEN
 ```
+
+Keep every `youtube:` setting in that single value (yt-dlp keeps only the last `--extractor-args` per extractor; the bot merges its own `skip=hls,dash` into yours), and do not combine it with `player_skip=webpage`: PO tokens for web clients need the watch page.
 
 Never commit or log PO tokens or YouTube cookies. Keep them in `.env` and rotate them right away if they leak. Manual tokens can be bound to a session or a single video and expire quickly, which is why a provider is preferred. Docker users must build a custom image that bundles the provider plugin and all of its runtime dependencies, since configuring the host alone is not enough.
 

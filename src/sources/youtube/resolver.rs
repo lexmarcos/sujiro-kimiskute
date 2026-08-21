@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -97,8 +100,28 @@ impl TrackResolver for YoutubeResolver {
             Err(error) => Err(error),
         };
 
-        log_stream_preparation(input_length, started_at, &result);
+        log_stream_preparation("stream_refresh", input_length, started_at, &result);
         result
+    }
+
+    async fn prefetch_stream(
+        &self,
+        track: &ResolvedTrack,
+    ) -> Result<Option<PreparedStream>, AppError> {
+        let input_length = track.webpage_url.len();
+        let started_at = Instant::now();
+        let input = ResolvedInput::parse_video_url(&track.webpage_url)?;
+        let Some(document) = self
+            .process
+            .execute_without_waiting(&resolution_arguments(&input, 1))
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let result = parse_prepared_stream(&document);
+        log_stream_preparation("stream_prefetch", input_length, started_at, &result);
+        result.map(Some)
     }
 }
 
@@ -189,9 +212,8 @@ impl ResolvedInput {
 fn reusable_stream(track: &ResolvedTrack) -> Option<&PreparedStream> {
     let stream = track.prepared_stream.as_ref()?;
     stream
-        .reuse_until
-        .is_some_and(|reuse_until| reuse_until > std::time::SystemTime::now())
-        .then_some(stream)
+        .is_reusable_at(SystemTime::now())
+        .then_some(stream.as_ref())
 }
 
 fn resolution_arguments(input: &ResolvedInput, max_playlist_size: usize) -> Vec<String> {
@@ -362,6 +384,7 @@ fn log_resolution(
 }
 
 fn log_stream_preparation(
+    input_kind: &'static str,
     input_length: usize,
     started_at: Instant,
     result: &Result<PreparedStream, AppError>,
@@ -369,14 +392,14 @@ fn log_stream_preparation(
     let duration_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     match result {
         Ok(_) => info!(
-            input_kind = "stream_refresh",
+            input_kind,
             input_length,
             result_count = 1,
             duration_ms,
             "YouTube stream preparation finished"
         ),
         Err(_) => warn!(
-            input_kind = "stream_refresh",
+            input_kind,
             input_length,
             result_count = 0,
             duration_ms,

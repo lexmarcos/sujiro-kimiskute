@@ -22,6 +22,7 @@ mod control;
 mod interrupt;
 mod lifecycle;
 mod play_requests;
+mod prefetch;
 mod queue;
 
 #[derive(Clone)]
@@ -57,6 +58,7 @@ struct GuildPlayerState {
     session_epoch: u64,
     playback_id: u64,
     queue_advancer_active: bool,
+    stream_prefetch: prefetch::StreamPrefetchState,
     lifecycle: PlayerLifecycle,
     auto_leave_generation: u64,
     auto_leave_timer: Option<AutoLeaveTimer>,
@@ -84,6 +86,7 @@ impl GuildPlayer {
                 session_epoch: 0,
                 playback_id: 0,
                 queue_advancer_active: false,
+                stream_prefetch: prefetch::StreamPrefetchState::default(),
                 lifecycle: PlayerLifecycle::Active,
                 auto_leave_generation: 0,
                 auto_leave_timer: None,

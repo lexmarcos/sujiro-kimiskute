@@ -1,6 +1,9 @@
-use std::collections::{VecDeque, vec_deque};
+use std::{
+    collections::{VecDeque, vec_deque},
+    time::SystemTime,
+};
 
-use crate::{error::AppError, player::track::QueuedTrack};
+use crate::{error::AppError, player::track::QueuedTrack, sources::resolver::PreparedStream};
 
 pub struct TrackQueue {
     tracks: VecDeque<QueuedTrack>,
@@ -45,6 +48,29 @@ impl TrackQueue {
 
     pub fn pop_next(&mut self) -> Option<QueuedTrack> {
         self.tracks.pop_front()
+    }
+
+    pub fn peek_next(&self) -> Option<&QueuedTrack> {
+        self.tracks.front()
+    }
+
+    /// Attaches a prefetched stream to the first queued copy of the track that
+    /// still lacks a usable one. Returns `false` when no such entry remains, for
+    /// example because the track was skipped or the queue was cleared meanwhile.
+    pub fn attach_stream(&mut self, track_id: &str, stream: PreparedStream) -> bool {
+        let now = SystemTime::now();
+        let Some(queued) = self.tracks.iter_mut().find(|queued| {
+            queued.track.id == track_id
+                && !queued
+                    .track
+                    .prepared_stream
+                    .as_ref()
+                    .is_some_and(|existing| existing.is_reusable_at(now))
+        }) else {
+            return false;
+        };
+        queued.track.prepared_stream = Some(Box::new(stream));
+        true
     }
 
     pub(crate) fn restore_current_to_front(&mut self, track: QueuedTrack) {

@@ -11,8 +11,9 @@ pub struct ResolvedTrack {
     pub start_at_seconds: Option<u64>,
     pub channel_name: Option<String>,
     pub thumbnail_url: Option<String>,
-    /// Stream selected while resolving the track, when the source provided one.
-    /// Signed source URLs expire, so the resolver decides whether it is still usable.
+    /// Stream selected while resolving or prefetching the track, when the source
+    /// provided one. Signed source URLs expire, so `PreparedStream::is_reusable_at`
+    /// decides whether it is still usable.
     /// Boxed to keep queued tracks small: most of them carry no stream yet.
     pub prepared_stream: Option<Box<PreparedStream>>,
 }

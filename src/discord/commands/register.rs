@@ -10,19 +10,22 @@ use crate::localization::BotLanguage;
 
 use super::{leave, pause, play, queue, resume, skip, stop};
 
+/// Boxes its Serenity source for the same reason `AppError::Discord` does:
+/// `serenity::Error` is 136 bytes, which would make every `Result` returning
+/// this enum larger than `clippy::result_large_err` allows.
 #[derive(Debug, Error)]
 pub enum CommandRegistrationError {
     #[error("failed to clear application commands for guild {guild_id}: {source}")]
     ClearGuild {
         guild_id: GuildId,
         #[source]
-        source: serenity::Error,
+        source: Box<serenity::Error>,
     },
 
     #[error("failed to register current global application commands: {source}")]
     RegisterGlobal {
         #[source]
-        source: serenity::Error,
+        source: Box<serenity::Error>,
     },
 }
 
@@ -57,7 +60,10 @@ async fn clear_guild(http: &Http, guild_id: GuildId) -> Result<(), CommandRegist
     let remaining = guild_id
         .set_commands(http, Vec::new())
         .await
-        .map_err(|source| CommandRegistrationError::ClearGuild { guild_id, source })?;
+        .map_err(|source| CommandRegistrationError::ClearGuild {
+            guild_id,
+            source: Box::new(source),
+        })?;
     info!(%guild_id, command_count = remaining.len(), "guild commands cleared");
     Ok(())
 }
@@ -69,7 +75,9 @@ async fn register_global(
     let commands: Vec<CreateCommand> = definitions(language);
     let registered = Command::set_global_commands(http, commands)
         .await
-        .map_err(|source| CommandRegistrationError::RegisterGlobal { source })?;
+        .map_err(|source| CommandRegistrationError::RegisterGlobal {
+            source: Box::new(source),
+        })?;
 
     info!(
         command_count = registered.len(),

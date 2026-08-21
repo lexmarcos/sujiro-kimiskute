@@ -10,12 +10,18 @@ const DEFAULT_BOT_ACTIVITY_TYPE: &str = "listening";
 const DEFAULT_BOT_LANGUAGE: &str = "pt-BR";
 const DEFAULT_BOT_ACTIVITY_CURRENT_TRACK: &str = "false";
 const DEFAULT_IDLE_LEAVE_SECONDS: &str = "300";
-const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "4";
+// Each resolution can peak near 300 MB when yt-dlp spawns a JavaScript runtime
+// for YouTube's challenges, so two is already plenty for the small hosts this
+// bot targets; the next track is prefetched while the current one plays.
+const DEFAULT_MAX_CONCURRENT_RESOLUTIONS: &str = "2";
 const DEFAULT_MAX_QUEUE_SIZE: &str = "50";
 const DEFAULT_PLAYER_PANEL_UPDATE_SECONDS: &str = "5";
 const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_YT_DLP_PATH: &str = "yt-dlp";
-const DEFAULT_YT_DLP_TIMEOUT_SECONDS: &str = "20";
+// Solving YouTube's JS challenges costs about two CPU seconds on a desktop and
+// ten times that on a low-end ARM board; 20 s killed yt-dlp before it finished
+// there, making every resolution fail.
+const DEFAULT_YT_DLP_TIMEOUT_SECONDS: &str = "45";
 
 pub struct AppConfig {
     pub discord_token: String,
